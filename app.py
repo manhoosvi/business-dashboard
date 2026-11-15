@@ -371,11 +371,12 @@ def gemini_insights(summary_json: str, model: str) -> str:
         "figures, do not claim causes the data cannot show, and say so if the data is too thin.\n\n"
         f"```json\n{summary_json}\n```"
     )
-    return ai.generate(prompt, str(get_secret("GEMINI_API_KEY")).strip(), model)
+    return ai.generate(prompt, AI_KEY, model)
 
 
 # ----------------------------- AI helpers (cached so each question / dataset costs one call) -----------------------------
-AI_KEY = str(get_secret("GEMINI_API_KEY", "") or "").strip()
+AI_KEY = str(get_secret("GEMINI_API_KEY", "") or "").strip().strip('"').strip("'")
+ai.USE_VERTEX = str(get_secret("GEMINI_USE_VERTEX", "")).lower() in ("1", "true", "yes")
 AI_ON = bool(AI_KEY)
 
 
@@ -640,6 +641,19 @@ if fetched_times:
     pills.append(f"<span class='fresh-pill'>Auto-refresh every {REFRESH_MINUTES} min</span>" if AUTO_REFRESH
                  else "<span class='fresh-pill'>Updates on open</span>")
 st.markdown(f'<div class="dashboard-subtitle">{"".join(pills) or "A live view of the selected dataset."}</div>', unsafe_allow_html=True)
+
+
+def ai_error_message(e: Exception) -> str:
+    low = str(e).lower()
+    if "api key not valid" in low or "api_key_invalid" in low or "permission_denied" in low or "unauthenticated" in low:
+        return ("Gemini rejected the API key. Check GEMINI_API_KEY in the app's Secrets: copy the whole key from "
+                "aistudio.google.com → Get API key (it may start with 'AQ.' or 'AIza'), inside quotes, with no spaces. "
+                f"Google's message: {str(e)[:120]}")
+    if "429" in low or "quota" in low or "resource_exhausted" in low:
+        return "Gemini's usage limit was reached. It will work again shortly (free limits reset every minute/day)."
+    if "not found" in low and "model" in low:
+        return "The Gemini model name isn't available for this key. Set GEMINI_MODEL in Secrets (e.g. gemini-2.5-flash)."
+    return str(e)[:160]
 
 
 # ============================= AI-designed dashboard =============================
@@ -908,7 +922,7 @@ def render_ai_dashboard(base: pd.DataFrame, data_name: str) -> None:
                 with st.container(border=True):
                     st.markdown(cached_insights(data_key, json.dumps(context, default=str, sort_keys=True)))
             except Exception as e:
-                st.warning(f"AI insights unavailable right now: {str(e)[:160]}")
+                st.warning(f"AI insights unavailable right now: {ai_error_message(e)}")
     else:
         st.caption("Filters are on. Click the button for insights on this filtered view.")
 
@@ -981,7 +995,7 @@ with tab_ask:
                             out["answer"] = ""
                     st.session_state["ask_out"] = {"q": question.strip(), **out}
                 except Exception as e:
-                    st.session_state["ask_out"] = {"q": question.strip(), "error": str(e)}
+                    st.session_state["ask_out"] = {"q": question.strip(), "error": ai_error_message(e)}
         out = st.session_state.get("ask_out")
         if out:
             st.markdown(f"**Q: {out['q']}**")
@@ -1021,7 +1035,7 @@ with tab_suggest:
                 try:
                     st.session_state[sugg_key] = cached_suggestions(prof)
                 except Exception as e:
-                    st.session_state[sugg_key] = {"error": str(e)}
+                    st.session_state[sugg_key] = {"error": ai_error_message(e)}
         plan = st.session_state.get(sugg_key)
         if plan:
             if plan.get("error"):
@@ -1063,7 +1077,7 @@ with tab_dash:
             except Exception as e:
                 if type(e).__name__ in ("StopException", "RerunException"):
                     raise
-                st.warning(f"The AI dashboard couldn't be built ({str(e)[:140]}). Showing the standard dashboard instead.")
+                st.warning(f"The AI dashboard couldn't be built: {ai_error_message(e)} Showing the standard dashboard instead.")
     available_objectives = []
     for name in OBJECTIVES:
         if name == "Sales performance" and mapping.get("revenue"): available_objectives.append(name)
@@ -1247,7 +1261,7 @@ with tab_dash:
                     try:
                         st.session_state[f"ai_text_{active_name}"] = gemini_insights(json.dumps(summary, sort_keys=True), GEMINI_MODEL)
                     except Exception as e:
-                        st.session_state[f"ai_text_{active_name}"] = f"⚠️ AI analysis failed: {e}"
+                        st.session_state[f"ai_text_{active_name}"] = f"⚠️ AI analysis failed: {ai_error_message(e)}"
             if st.session_state.get(f"ai_text_{active_name}"):
                 st.markdown(st.session_state[f"ai_text_{active_name}"])
 

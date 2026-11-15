@@ -21,24 +21,18 @@ FORBIDDEN = re.compile(
 
 
 # ----------------------------- Gemini call -----------------------------
+USE_VERTEX = False  # set True only for Google Cloud Vertex AI keys (the app reads GEMINI_USE_VERTEX from Secrets)
+
+
 def generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
-    """Call Gemini. Supports AI Studio keys (AIza...) and Vertex express keys (AQ....)."""
+    """Call Gemini through the standard Gemini API. Works with both AI Studio key formats:
+    the older 'AIza...' keys and the newer 'AQ.Ab...' auth keys."""
     from google import genai
 
     cfg = {"response_mime_type": "application/json"} if json_mode else None
-    use_vertex = key.startswith("AQ.")
-
-    def run(vertex: bool) -> str:
-        client = genai.Client(vertexai=True, api_key=key) if vertex else genai.Client(api_key=key)
-        return (client.models.generate_content(model=model, contents=prompt, config=cfg).text or "").strip()
-
-    try:
-        return run(use_vertex)
-    except Exception as first:
-        try:
-            return run(not use_vertex)
-        except Exception:
-            raise first
+    key = key.strip().strip('"').strip("'")
+    client = genai.Client(vertexai=True, api_key=key) if USE_VERTEX else genai.Client(api_key=key)
+    return (client.models.generate_content(model=model, contents=prompt, config=cfg).text or "").strip()
 
 
 def parse_json(text: str) -> dict:
