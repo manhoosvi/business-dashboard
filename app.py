@@ -22,6 +22,7 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
+import ai
 from pipeline import breakdown_with_sql, clean_with_sql, kpis_with_sql, q
 
 try:  # optional, only useful when running locally
@@ -78,11 +79,19 @@ def configured_sources() -> dict:
 st.markdown("""
 <style>
 :root { --ink:#202124; --muted:#555b65; --line:#e5e7eb; --rose:#a64f68; --paper:#ffffff; }
-.block-container {padding-top:1rem; padding-bottom:1.1rem; max-width:1600px;}
+.stApp {background:#f7f6f8;}
+[data-testid="stHeader"] {background:rgba(247,246,248,.92);}
+[data-testid="stMain"] [data-testid="stMarkdownContainer"] p, [data-testid="stMain"] label p,
+[data-testid="stMain"] [data-testid="stWidgetLabel"] p {color:#202124;}
+.block-container {padding-top:3.6rem; padding-bottom:1.1rem; max-width:1600px;}
 [data-testid="stSidebar"] {background:#25232b; border-right:1px solid #393640;}
 [data-testid="stSidebar"] * {color:#f5f3f5 !important;}
 [data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {color:#c9c5cc !important;}
-[data-testid="stSidebar"] [data-baseweb="select"] div, [data-testid="stSidebar"] [data-baseweb="input"] input {color:#202124 !important;}
+[data-testid="stSidebar"] [data-baseweb="select"] > div {background:#34313b !important; border-color:#77717f !important;}
+[data-testid="stSidebar"] [data-baseweb="select"] * {color:#f5f3f5 !important;}
+[data-testid="stSidebar"] [data-baseweb="select"] svg {fill:#f5f3f5 !important;}
+[data-testid="stSidebar"] div[data-testid="stExpander"] {background:#34313b !important; border-color:#514c58 !important;}
+[data-testid="stSidebar"] div[data-testid="stExpander"] summary:hover {background:#3d3a45;}
 [data-testid="stSidebar"] [data-testid="stFileUploader"] section {background:#34313b;border:1px dashed #77717f;}
 [data-testid="stSidebar"] [data-testid="stFileUploader"] section * {color:#f5f3f5 !important;}
 [data-testid="stSidebar"] hr {border-color:#514c58;}
@@ -143,20 +152,32 @@ def norm(x: Any) -> str:
 
 
 def suggest_mapping(df) -> dict:
+    """Rule-based column matching: exact names first, then whole-word matches; a column is used once."""
     if df is None:
         return {}
     normalized = {norm(c): str(c) for c in df.columns}
-    out = {}
-    for role, aliases in ROLE_ALIASES.items():
+    out, used = {}, set()
+    for role, aliases in ROLE_ALIASES.items():  # pass 1: exact name
         for alias in aliases:
-            if alias in normalized:
-                out[role] = normalized[alias]
+            col = normalized.get(alias)
+            if col and col not in used:
+                out[role] = col
+                used.add(col)
                 break
-        if role not in out:
-            for n, original in normalized.items():
-                if any(a in n for a in aliases):
-                    out[role] = original
-                    break
+
+    def has_words(name: str, alias: str) -> bool:
+        tokens, words = name.split("_"), alias.split("_")
+        return any(tokens[i:i + len(words)] == words for i in range(len(tokens) - len(words) + 1))
+
+    for role, aliases in ROLE_ALIASES.items():  # pass 2: alias appears as whole word(s), e.g. "Net Sales (INR)"
+        if role in out:
+            continue
+        for alias in aliases:
+            col = next((orig for n, orig in normalized.items() if orig not in used and has_words(n, alias)), None)
+            if col:
+                out[role] = col
+                used.add(col)
+                break
     return out
 
 
@@ -183,12 +204,24 @@ def to_fetch_url(url: str) -> str:
     return url
 
 
+def source_title(disposition: str) -> str:
+    """Google sends the file name, e.g. 'sample - Sheet1.csv' -> 'sample · Sheet1'."""
+    from urllib.parse import unquote
+    m = re.search(r"filename\*=UTF-8''([^;]+)", disposition) or re.search(r'filename="?([^";]+)"?', disposition)
+    if not m:
+        return ""
+    name = os.path.splitext(unquote(m.group(1)).strip())[0]
+    return name.replace(" - ", " · ")
+
+
 @st.cache_data(ttl=FETCH_TTL, show_spinner=False, max_entries=200)
 def fetch_source(location: str, visit_token: str = "") -> dict:
     """Download the raw bytes of a source. Errors are not cached, so failures retry next cycle."""
+    title = ""
     if os.path.exists(location):  # local path (useful for testing)
         with open(location, "rb") as fh:
             data = fh.read()
+        title = os.path.splitext(os.path.basename(location))[0]
     else:
         r = requests.get(to_fetch_url(location), timeout=30)
         r.raise_for_status()
@@ -196,7 +229,8 @@ def fetch_source(location: str, visit_token: str = "") -> dict:
             raise ValueError("The link returned a web page instead of data. Share the Sheet/file as "
                              "'Anyone with the link – Viewer', or use File → Share → Publish to web → CSV.")
         data = r.content
-    return {"bytes": data, "hash": hashlib.md5(data).hexdigest(),
+        title = source_title(r.headers.get("content-disposition", ""))
+    return {"bytes": data, "hash": hashlib.md5(data).hexdigest(), "title": title,
             "fetched_at": datetime.now(TZ).strftime("%d %b %Y, %H:%M")}
 
 
@@ -282,21 +316,18 @@ def plot_theme(fig, height=260):
     fig.update_layout(
         height=height, margin=dict(l=12, r=12, t=38, b=12),
         paper_bgcolor="white", plot_bgcolor="white",
-        font=dict(family="Arial", size=11, color="#514a50"),
+        template="plotly_white",
+        font=dict(family="Arial", size=12, color="#3a3438"),
         title=dict(font=dict(size=13, color="#3d353b"), x=0.02),
-        legend=dict(orientation="h", y=1.12, x=0),
+        legend=dict(orientation="h", y=1.12, x=0, title_text=""),
     )
-    fig.update_xaxes(showgrid=False, linecolor="#eee8eb")
-    fig.update_yaxes(gridcolor="#f1edef", zeroline=False)
+    fig.update_xaxes(showgrid=False, linecolor="#d9d2d6", tickfont=dict(color="#3a3438"), title_font=dict(color="#3a3438"))
+    fig.update_yaxes(gridcolor="#efe8ec", zeroline=False, tickfont=dict(color="#3a3438"), title_font=dict(color="#3a3438"))
     return fig
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def gemini_insights(summary_json: str, model: str) -> str:
-    from google import genai  # imported lazily so the app runs without the package
-    key = str(get_secret("GEMINI_API_KEY")).strip()
-    # AI Studio keys usually start with "AIza"; Vertex AI (express mode) keys start with "AQ.".
-    use_vertex = str(get_secret("GEMINI_USE_VERTEX", "")).lower() in ("1", "true", "yes") or key.startswith("AQ.")
     prompt = (
         "You are a business analyst writing for a team dashboard. Using ONLY the aggregated figures in "
         "the JSON below, write concise markdown with three sections: **Key observations** (3-5 bullets "
@@ -304,14 +335,67 @@ def gemini_insights(summary_json: str, model: str) -> str:
         "figures, do not claim causes the data cannot show, and say so if the data is too thin.\n\n"
         f"```json\n{summary_json}\n```"
     )
+    return ai.generate(prompt, str(get_secret("GEMINI_API_KEY")).strip(), model)
+
+
+# ----------------------------- AI helpers (cached so each question / dataset costs one call) -----------------------------
+AI_KEY = str(get_secret("GEMINI_API_KEY", "") or "").strip()
+AI_ON = bool(AI_KEY)
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def cached_ai_mapping(profile_json: str, missing: tuple, used: tuple) -> dict:
+    return ai.ai_column_mapping(json.loads(profile_json), list(missing), list(used), AI_KEY, GEMINI_MODEL)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_text_to_sql(question: str, profile_json: str, previous_sql: str = None, error: str = None) -> dict:
+    return ai.text_to_sql(question, json.loads(profile_json), AI_KEY, GEMINI_MODEL, previous_sql, error)
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_answer(question: str, result_csv: str) -> str:
+    return ai.answer_from_result(question, pd.read_csv(BytesIO(result_csv.encode())), AI_KEY, GEMINI_MODEL)
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def cached_suggestions(profile_json: str) -> dict:
+    return ai.suggest_analyses(json.loads(profile_json), AI_KEY, GEMINI_MODEL)
+
+
+def ask_with_retry(question: str, profile_json: str, data: pd.DataFrame) -> dict:
+    """Question -> SQL -> run. If the SQL fails, give the error back to the AI once to fix it."""
+    plan = cached_text_to_sql(question, profile_json)
+    if not plan.get("sql"):
+        return {"sql": None, "explanation": plan.get("explanation", "The data can't answer that question.")}
     try:
-        client = genai.Client(vertexai=True, api_key=key) if use_vertex else genai.Client(api_key=key)
-        resp = client.models.generate_content(model=model, contents=prompt)
-    except Exception:
-        # wrong guess about the key type: try the other Gemini endpoint once
-        client = genai.Client(api_key=key) if use_vertex else genai.Client(vertexai=True, api_key=key)
-        resp = client.models.generate_content(model=model, contents=prompt)
-    return (resp.text or "").strip()
+        return {**plan, "result": ai.run_sql(data, plan["sql"])}
+    except Exception as e:
+        fixed = cached_text_to_sql(question, profile_json, plan["sql"], str(e)[:500])
+        if not fixed.get("sql"):
+            raise
+        return {**fixed, "result": ai.run_sql(data, fixed["sql"])}
+
+
+def result_chart(res: pd.DataFrame, kind: str = "auto", title: str = ""):
+    """Pick a simple chart for a query result: first column = label/date, first numeric column = value."""
+    if res is None or res.empty or res.shape[1] < 2 or kind == "table":
+        return None
+    x = res.columns[0]
+    nums = [c for c in res.columns[1:] if pd.api.types.is_numeric_dtype(res[c])]
+    if not nums:
+        return None
+    y = nums[0]
+    is_time = pd.api.types.is_datetime64_any_dtype(res[x])
+    if kind == "line" or (kind == "auto" and is_time):
+        fig = px.line(res, x=x, y=y, markers=True, title=title)
+        fig.update_traces(line=dict(color="#a64f68", width=2.5))
+    else:
+        data = res.head(25).copy()
+        data[x] = data[x].astype(str)
+        fig = px.bar(data, x=x, y=y, title=title, text_auto=".3s")
+        fig.update_traces(marker_color="#b8667d")
+    return plot_theme(fig, 300)
 
 
 # ----------------------------- Run the ingestion pipeline -----------------------------
@@ -326,12 +410,15 @@ for name, loc in sources.items():
     try:
         raw = fetch_source(loc, VISIT)
         clean, rep, clean_sql = process_bytes(raw["hash"], raw["bytes"], loc)
-        cleaning_sql[name] = clean_sql
+        label = raw.get("title") or name
+        if label in datasets:
+            label = f"{label} ({name})"
+        cleaning_sql[label] = clean_sql
         signature.append(raw["hash"])
         if clean.empty:
             raise ValueError("Source contains no data rows")
-        datasets[name] = clean
-        pipeline_log.append({"Source": name, "Type": "Connected", "Status": "✅ OK", "Last fetched": raw["fetched_at"], **rep})
+        datasets[label] = clean
+        pipeline_log.append({"Source": label, "Type": "Connected", "Status": "✅ OK", "Last fetched": raw["fetched_at"], **rep})
     except Exception as e:
         signature.append(f"error:{name}")
         pipeline_log.append({"Source": name, "Type": "Connected", "Status": f"⚠️ {str(e)[:140]}", "Last fetched": "—"})
@@ -412,12 +499,28 @@ with st.sidebar:
         active_name = st.selectbox("Dataset", list(datasets.keys()))
         raw_df = datasets[active_name]
         auto = suggest_mapping(raw_df)
+        ai_roles = set()
+        # AI fallback: if name rules left roles empty and there are unclaimed columns, ask Gemini once
+        missing = [r for r in ROLE_ALIASES if r not in auto]
+        unclaimed = [c for c in map(str, raw_df.columns) if c not in auto.values()]
+        if AI_ON and missing and unclaimed:
+            try:
+                prof = json.dumps(ai.schema_profile(raw_df), sort_keys=True)
+                with st.spinner("AI is reading your columns…"):
+                    extra = cached_ai_mapping(prof, tuple(missing), tuple(sorted(auto.values())))
+                auto.update(extra)
+                ai_roles = set(extra)
+            except Exception as e:
+                st.caption(f"AI column mapping unavailable: {str(e)[:80]}")
+        if ai_roles:
+            st.caption(f"🤖 AI matched {len(ai_roles)} column(s) the name rules missed. Check them below.")
         with st.expander("Review column mapping", expanded=False):
             for role in ROLE_ALIASES:
                 opts = ["Not mapped"] + list(map(str, raw_df.columns))
                 default = auto.get(role, "Not mapped")
                 idx = opts.index(default) if default in opts else 0
-                val = st.selectbox(role.replace("_", " ").title(), opts, index=idx, key=f"map_{active_name}_{role}")
+                label = role.replace("_", " ").title() + (" 🤖" if role in ai_roles else "")
+                val = st.selectbox(label, opts, index=idx, key=f"map_{active_name}_{role}_{default}")
                 if val != "Not mapped":
                     mapping[role] = val
         st.caption(f"{len(raw_df):,} rows · {len(raw_df.columns)} columns")
@@ -484,231 +587,342 @@ if fetched_times:
                  else "<span class='fresh-pill'>Updates on open</span>")
 st.markdown(f'<div class="dashboard-subtitle">{"".join(pills) or "A live view of the selected dataset."}</div>', unsafe_allow_html=True)
 
-available_objectives = []
-for name in OBJECTIVES:
-    if name == "Sales performance" and mapping.get("revenue"): available_objectives.append(name)
-    elif name == "Profitability" and mapping.get("revenue") and mapping.get("cost"): available_objectives.append(name)
-    elif name == "Customer analysis" and mapping.get("customer_id"): available_objectives.append(name)
-    elif name == "Marketing performance" and mapping.get("marketing_spend"): available_objectives.append(name)
-    elif name == "Campaign funnel" and mapping.get("impressions") and mapping.get("clicks"): available_objectives.append(name)
-    elif name == "Product / regional analysis" and (mapping.get("product") or mapping.get("region")): available_objectives.append(name)
+tab_dash, tab_ask, tab_suggest = st.tabs(["📊 Dashboard", "💬 Ask your data", "✨ AI-suggested analyses"])
 
-if not available_objectives:
-    st.warning("No standard objectives can be calculated yet. Open Analysis → Review column mapping in the sidebar.")
-    st.stop()
+# The AI tabs work on the full dataset (with a typed "_date" column for time questions).
+ai_df = raw_df.assign(_date=date_all) if date_all is not None else raw_df
+AI_PRIVACY = ("The AI sees column names, types and up to 3 example values per column, never the full dataset. "
+              "It writes SQL; the numbers come from running that SQL on your data.")
 
-chosen = st.multiselect(
-    "Choose business objectives",
-    available_objectives,
-    default=available_objectives[:2] if len(available_objectives) > 1 else available_objectives,
-    key=f"objective_select_{active_name}",
-    help="Selected objectives stay visible here. The dashboard updates to show relevant metrics and charts.",
-)
-if not chosen:
-    st.info("Select at least one objective to populate the dashboard.")
-    st.stop()
 
-# Compact filter row. Only dimensions that exist in this dataset are shown.
-df = raw_df.copy()
-filter_cols = [c for c in [mapping.get("region"), mapping.get("product"), mapping.get("channel"),
-                           "Source" if "Source" in df.columns and active_name == "All sources (combined)" else None]
-               if c and c in df.columns and df[c].nunique(dropna=True) <= 80]
-filter_cols = list(dict.fromkeys(filter_cols))
-date_series = parse_date(df, mapping.get("date"))
-fcols = st.columns(1 + len(filter_cols) + (1 if date_series is not None else 0))
-ci = 0
-if date_series is not None:
-    dates = date_series.dropna()
-    if not dates.empty:
-        min_d, max_d = dates.min().date(), dates.max().date()
-        selected_range = fcols[ci].date_input("Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d,
-                                              key=f"date_{active_name}_{min_d}_{max_d}")
-        ci += 1
-        if isinstance(selected_range, tuple) and len(selected_range) == 2:
-            df = df.loc[date_series.dt.date.between(selected_range[0], selected_range[1])]
-for col in filter_cols:
-    vals = sorted(df[col].dropna().astype(str).unique().tolist())
-    picked = fcols[ci].multiselect(str(col), vals, default=[], placeholder="All", key=f"f_{active_name}_{col}")
-    ci += 1
-    if picked: df = df[df[col].astype(str).isin(picked)]
+def ai_off_message():
+    st.info("Add `GEMINI_API_KEY` to the app's Secrets to switch on the AI features.")
 
-date_filtered = parse_date(df, mapping.get("date"))
-df = df.assign(_date=date_filtered) if date_filtered is not None else df  # typed date column for SQL
-st.markdown('<div class="section-label">Performance at a glance</div>', unsafe_allow_html=True)
-sql_log = {}
-metrics, sql_log["Headline KPIs"] = build_metrics(df, mapping)
 
-# Latest month vs previous month (historical comparison)
-mrev, month_sql = monthly_revenue(df, mapping)
-if month_sql: sql_log["Monthly revenue"] = month_sql
-if mrev is not None and len(mrev) >= 2 and "Total revenue" in metrics:
-    last, prev = float(mrev.iloc[-1]), float(mrev.iloc[-2])
-    if prev:
-        pct = (last - prev) / prev * 100
-        cls, arrow = ("kpi-up", "▲") if pct >= 0 else ("kpi-down", "▼")
-        metrics["Total revenue"] = (metrics["Total revenue"][0],
-                                    f"<span class='{cls}'>{arrow} {abs(pct):.1f}%</span> {mrev.index[-1]} vs {mrev.index[-2]}")
-
-objective_metric_order = {
-    "Sales performance": ["Total revenue", "Average order value", "Units sold"],
-    "Profitability": ["Gross profit", "Gross margin"],
-    "Customer analysis": ["Unique customers", "Revenue per customer"],
-    "Marketing performance": ["Marketing spend", "ROAS proxy", "Cost per conversion"],
-    "Campaign funnel": ["Click-through rate", "Click-to-conversion"],
-    "Product / regional analysis": ["Units sold", "Total revenue"],
-}
-wanted = []
-for objective in chosen:
-    for metric in objective_metric_order[objective]:
-        if metric in metrics and metric not in wanted: wanted.append(metric)
-if not wanted: wanted = list(metrics)[:6]
-wanted = wanted[:6]
-if wanted:
-    cards = st.columns(len(wanted))
-    for col, name in zip(cards, wanted):
-        value, note = metrics[name]
-        col.markdown(f'<div class="kpi-card"><div class="kpi-label">{name}</div><div class="kpi-value">{value}</div><div class="kpi-note">{note}</div></div>', unsafe_allow_html=True)
-else:
-    st.info("The selected objectives do not have enough mapped fields to calculate KPIs.")
-
-# Charts are selected automatically from the objective + available columns.
-st.markdown('<div class="section-label" style="margin-top:1rem">Performance analysis</div>', unsafe_allow_html=True)
-chart_specs = []
-rev_col, cost_col = mapping.get("revenue"), mapping.get("cost")
-dim_candidates = []
-for role in ["product", "region", "channel"]:
-    c = mapping.get(role)
-    if c and c in df.columns and 1 < df[c].nunique(dropna=True) <= 40 and c not in dim_candidates:
-        dim_candidates.append(c)
-if mrev is not None and "Sales performance" in chosen:
-    trend = pd.DataFrame({"_date": mrev.index.to_timestamp(), "_revenue": mrev.values})
-    fig = px.line(trend, x="_date", y="_revenue", markers=True, title="Revenue trend",
-                  labels={"_date": "Month", "_revenue": "Revenue"})
-    fig.update_traces(line=dict(color="#a64f68", width=2.5), marker=dict(size=5))
-    chart_specs.append(("wide", plot_theme(fig, 260)))
-if rev_col and rev_col in df.columns and dim_candidates and any(o in chosen for o in ["Sales performance", "Product / regional analysis", "Profitability"]):
-    dcol = dim_candidates[0]
-    tmp, sql_log[f"Revenue by {dcol}"] = breakdown_with_sql(
-        df, q(dcol), {"_metric": f"SUM(TRY_CAST({q(rev_col)} AS DOUBLE))"}, order_by='"_metric" DESC', limit=10)
-    tmp = tmp.rename(columns={"grp": dcol})
-    tmp[dcol] = tmp[dcol].astype(str)
-    fig = px.bar(tmp, x="_metric", y=dcol, orientation="h", title=f"Revenue by {dcol}", text_auto=".2s", labels={"_metric": "Revenue"})
-    fig.update_traces(marker_color="#b8667d", textposition="outside", cliponaxis=False)
-    fig.update_layout(yaxis=dict(categoryorder="total ascending"))
-    chart_specs.append(("half", plot_theme(fig, 260)))
-if rev_col and cost_col and rev_col in df.columns and cost_col in df.columns and "Profitability" in chosen:
-    tmp = df.assign(Revenue=pd.to_numeric(df[rev_col], errors="coerce").fillna(0), Cost=pd.to_numeric(df[cost_col], errors="coerce").fillna(0))
-    if dim_candidates:
-        tmp = tmp.groupby(dim_candidates[0], as_index=False)[["Revenue", "Cost"]].sum().sort_values("Revenue", ascending=False).head(10)
-        fig = px.bar(tmp, x=dim_candidates[0], y=["Revenue", "Cost"], barmode="group", title="Revenue vs cost",
-                     color_discrete_sequence=["#b8667d", "#d9b2bc"])
+with tab_ask:
+    st.markdown("### Ask a question about your data")
+    st.caption(AI_PRIVACY)
+    if not AI_ON:
+        ai_off_message()
     else:
-        fig = go.Figure(data=[go.Bar(name="Revenue", x=["Total"], y=[tmp.Revenue.sum()], marker_color="#b8667d"),
-                              go.Bar(name="Cost", x=["Total"], y=[tmp.Cost.sum()], marker_color="#d9b2bc")])
-        fig.update_layout(barmode="group", title="Revenue vs cost")
-    chart_specs.append(("half", plot_theme(fig, 260)))
-if mapping.get("customer_id") and mapping["customer_id"] in df.columns and "Customer analysis" in chosen:
-    cust = df.groupby(mapping["customer_id"]).size().reset_index(name="Records").sort_values("Records", ascending=False).head(8)
-    cust[mapping["customer_id"]] = cust[mapping["customer_id"]].astype(str)
-    fig = px.bar(cust, x="Records", y=mapping["customer_id"], orientation="h", title="Top customers by records")
-    fig.update_traces(marker_color="#c58a9a")
-    fig.update_layout(yaxis=dict(categoryorder="total ascending", type="category"))
-    chart_specs.append(("half", plot_theme(fig, 250)))
-if mapping.get("channel") and mapping["channel"] in df.columns and "Marketing performance" in chosen:
-    measure = mapping.get("marketing_spend")
-    if measure and measure in df.columns:
-        tmp = df.assign(_spend=pd.to_numeric(df[measure], errors="coerce")).groupby(mapping["channel"], as_index=False)["_spend"].sum().sort_values("_spend", ascending=False).head(8)
-        fig = px.pie(tmp, names=mapping["channel"], values="_spend", hole=.58, title="Marketing spend by channel")
-        fig.update_traces(marker=dict(colors=["#98445f", "#bd7186", "#d99baa", "#e8c6ce", "#b9a2a9"]))
-        chart_specs.append(("half", plot_theme(fig, 250)))
-if mapping.get("impressions") and mapping.get("clicks") and "Campaign funnel" in chosen:
-    imp = float(pd.to_numeric(df[mapping["impressions"]], errors="coerce").sum())
-    clk = float(pd.to_numeric(df[mapping["clicks"]], errors="coerce").sum())
-    fig = go.Figure(go.Funnel(y=["Impressions", "Clicks"], x=[imp, clk], textinfo="value+percent initial", marker=dict(color=["#d9a3b0", "#a64f68"])))
-    fig.update_layout(title="Campaign funnel")
-    chart_specs.append(("half", plot_theme(fig, 250)))
-
-if chart_specs:
-    if chart_specs[0][0] == "wide":
-        st.plotly_chart(chart_specs[0][1], width="stretch", config={"displayModeBar": False})
-        rest = chart_specs[1:]
-    else:
-        rest = chart_specs
-    for i in range(0, len(rest), 2):
-        cols = st.columns(2)
-        for j, item in enumerate(rest[i:i + 2]):
-            with cols[j]:
-                st.plotly_chart(item[1], width="stretch", config={"displayModeBar": False})
-else:
-    st.info("More charts will appear when the selected objectives have suitable date, category or numeric fields.")
-
-# ----------------------------- AI analysis (Gemini) -----------------------------
-with st.expander("AI analysis", expanded=False):
-    if not get_secret("GEMINI_API_KEY"):
-        st.write("Add `GEMINI_API_KEY` to the app's secrets to enable AI-written insights. "
-                 "The key stays on the server; viewers never see it.")
-    else:
-        summary = {
-            "dataset": active_name, "rows_analysed": int(len(df)), "objectives": chosen,
-            "kpis": {k: re.sub(r"<[^>]+>", "", f"{v} ({n})") for k, (v, n) in metrics.items()},
-        }
-        if date_filtered is not None and date_filtered.notna().any():
-            summary["date_range"] = f"{date_filtered.min():%Y-%m-%d} to {date_filtered.max():%Y-%m-%d}"
-        if mrev is not None:
-            summary["monthly_revenue_last_12"] = {str(k): round(float(v), 2) for k, v in mrev.tail(12).items()}
-        if rev_col and rev_col in df.columns:
-            for dcol in dim_candidates[:3]:
-                top = df.assign(_r=pd.to_numeric(df[rev_col], errors="coerce")).groupby(dcol)["_r"].sum().sort_values(ascending=False)
-                summary[f"revenue_by_{dcol}_top5"] = {str(k): round(float(v), 2) for k, v in top.head(5).items()}
-                summary[f"revenue_by_{dcol}_bottom3"] = {str(k): round(float(v), 2) for k, v in top.tail(3).items()}
-        st.caption("Only the aggregated figures shown on this page are sent to the model; no row-level records.")
-        if st.button("Generate AI insights", key=f"ai_{active_name}"):
-            with st.spinner("Analysing the latest numbers…"):
+        examples = ["Which region had the highest revenue?", "Show monthly revenue for the last 6 months",
+                    "Top 5 products by profit margin", "How many orders per channel?"]
+        ex_cols = st.columns(len(examples))
+        for i, ex in enumerate(examples):
+            if ex_cols[i].button(ex, key=f"ex_{i}", width="stretch"):
+                st.session_state["ask_q"] = ex
+        with st.form("ask_form", clear_on_submit=False, border=False):
+            question = st.text_input("Your question", key="ask_q", placeholder="e.g. Which product sold the most units in March?")
+            asked = st.form_submit_button("Ask", type="primary")
+        if asked and question.strip():
+            prof = json.dumps(ai.schema_profile(ai_df), sort_keys=True)
+            with st.spinner("Writing and running SQL…"):
                 try:
-                    st.session_state[f"ai_text_{active_name}"] = gemini_insights(json.dumps(summary, sort_keys=True), GEMINI_MODEL)
+                    out = ask_with_retry(question.strip(), prof, ai_df)
+                    if out.get("sql") and out.get("result") is not None:
+                        try:
+                            out["answer"] = cached_answer(question.strip(), out["result"].head(25).to_csv(index=False))
+                        except Exception:
+                            out["answer"] = ""
+                    st.session_state["ask_out"] = {"q": question.strip(), **out}
                 except Exception as e:
-                    st.session_state[f"ai_text_{active_name}"] = f"⚠️ AI analysis failed: {e}"
-        if st.session_state.get(f"ai_text_{active_name}"):
-            st.markdown(st.session_state[f"ai_text_{active_name}"])
+                    st.session_state["ask_out"] = {"q": question.strip(), "error": str(e)}
+        out = st.session_state.get("ask_out")
+        if out:
+            st.markdown(f"**Q: {out['q']}**")
+            if out.get("error"):
+                st.error(f"Couldn't answer that: {out['error'][:300]}")
+            elif not out.get("sql"):
+                st.warning(out.get("explanation", "The data can't answer that question."))
+            else:
+                if out.get("answer"):
+                    st.success(out["answer"])
+                res = out["result"]
+                fig = result_chart(res)
+                left, right = st.columns([1.3, 1]) if fig is not None else (st.container(), None)
+                if fig is not None:
+                    with left:
+                        st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False})
+                    with right:
+                        st.dataframe(res, width="stretch", hide_index=True, height=300)
+                else:
+                    st.dataframe(res, width="stretch", hide_index=True)
+                with st.expander("SQL used"):
+                    st.caption(out.get("explanation", ""))
+                    st.code(out["sql"], language="sql")
 
-# ----------------------------- Data, quality and pipeline status -----------------------------
-with st.expander("Explore underlying data and data quality"):
-    left, right = st.columns([1.5, 1])
-    with left:
-        st.markdown("**Filtered records**")
-        st.dataframe(df.drop(columns=["_date"], errors="ignore").head(100), width="stretch", height=300, hide_index=True)
-    with right:
-        qdf = df.drop(columns=["_date"], errors="ignore")
-        quality = pd.DataFrame({"Column": qdf.columns.astype(str), "Type": [str(qdf[c].dtype) for c in qdf.columns],
-                                "Missing": [int(qdf[c].isna().sum()) for c in qdf.columns],
-                                "Unique": [int(qdf[c].nunique(dropna=True)) for c in qdf.columns]})
-        st.markdown("**Data quality**")
-        st.dataframe(quality, width="stretch", height=300, hide_index=True)
+with tab_suggest:
+    st.markdown("### Analyses the AI recommends for this dataset")
+    st.caption(AI_PRIVACY)
+    if not AI_ON:
+        ai_off_message()
+    else:
+        prof = json.dumps(ai.schema_profile(ai_df), sort_keys=True)
+        sugg_key = f"sugg_{hashlib.md5(prof.encode()).hexdigest()}"
+        if st.button("Generate suggestions" if sugg_key not in st.session_state else "Regenerate", type="primary"):
+            if sugg_key in st.session_state:
+                cached_suggestions.clear()
+            with st.spinner("Studying the dataset…"):
+                try:
+                    st.session_state[sugg_key] = cached_suggestions(prof)
+                except Exception as e:
+                    st.session_state[sugg_key] = {"error": str(e)}
+        plan = st.session_state.get(sugg_key)
+        if plan:
+            if plan.get("error"):
+                st.error(f"AI suggestions failed: {plan['error'][:300]}")
+            else:
+                if plan.get("summary"):
+                    st.info(plan["summary"])
+                items = plan.get("analyses", [])[:6]
+                for i in range(0, len(items), 2):
+                    cols = st.columns(2)
+                    for j, item in enumerate(items[i:i + 2]):
+                        with cols[j]:
+                            st.markdown(f"**{item.get('title', 'Analysis')}**")
+                            st.caption(item.get("why", ""))
+                            try:
+                                res = ai.run_sql(ai_df, item.get("sql", ""))
+                                fig = result_chart(res, item.get("chart", "auto"))
+                                if fig is not None:
+                                    st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False},
+                                                    key=f"sugg_chart_{i + j}")
+                                else:
+                                    st.dataframe(res, width="stretch", hide_index=True, height=260)
+                            except Exception as e:
+                                st.warning(f"This analysis couldn't run on the data: {str(e)[:120]}")
+                            with st.expander("SQL"):
+                                st.code(item.get("sql", ""), language="sql")
+        else:
+            st.write("Click **Generate suggestions** and the AI will propose the most useful analyses for this "
+                     "dataset, each backed by a SQL query that runs on your real data.")
 
-with st.expander("SQL behind these numbers"):
-    st.caption("Cleaning and KPI calculations run as SQL in an embedded DuckDB engine on every refresh. "
-               "The live queries for the current view are shown below.")
-    src_names = [n for n in cleaning_sql if n == active_name] or list(cleaning_sql)[:1]
-    for n in src_names:
-        st.markdown(f"**Cleaning: {n}**")
-        st.code(cleaning_sql[n], language="sql")
-    for title, sql in sql_log.items():
-        st.markdown(f"**{title}**")
-        st.code(sql, language="sql")
+with tab_dash:
+    available_objectives = []
+    for name in OBJECTIVES:
+        if name == "Sales performance" and mapping.get("revenue"): available_objectives.append(name)
+        elif name == "Profitability" and mapping.get("revenue") and mapping.get("cost"): available_objectives.append(name)
+        elif name == "Customer analysis" and mapping.get("customer_id"): available_objectives.append(name)
+        elif name == "Marketing performance" and mapping.get("marketing_spend"): available_objectives.append(name)
+        elif name == "Campaign funnel" and mapping.get("impressions") and mapping.get("clicks"): available_objectives.append(name)
+        elif name == "Product / regional analysis" and (mapping.get("product") or mapping.get("region")): available_objectives.append(name)
 
-with st.expander("Pipeline status"):
-    if pipeline_log:
-        log = pd.DataFrame(pipeline_log)
-        if "numeric_converted" in log:
-            log["numeric_converted"] = log["numeric_converted"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
-        if "empty_columns_dropped" in log:
-            log["empty_columns_dropped"] = log["empty_columns_dropped"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
-        log = log.rename(columns={"empty_columns_dropped": "Empty columns dropped", "rows_in": "Rows in", "rows_out": "Rows out", "empty_rows_removed": "Empty rows removed",
-                                  "duplicates_removed": "Duplicates removed", "columns": "Columns",
-                                  "numeric_converted": "Text→number columns"})
-        st.dataframe(log, width="stretch", hide_index=True)
-    st.caption("Each source is fetched, validated and cleaned automatically. " +
-               (f"Connected sources are re-checked every {REFRESH_MINUTES} minutes." if AUTO_REFRESH
-                else "Connected sources are re-read every time the dashboard is opened, or when Refresh now is pressed."))
+    if not available_objectives:
+        st.warning("No standard objectives can be calculated yet. Open Analysis → Review column mapping in the sidebar.")
+        st.stop()
 
-st.caption(f"Showing {len(df):,} of {len(raw_df):,} rows · {len(chosen)} objective(s) selected · Metrics are calculated from the currently filtered dataset.")
+    chosen = st.multiselect(
+        "Choose business objectives",
+        available_objectives,
+        default=available_objectives[:2] if len(available_objectives) > 1 else available_objectives,
+        key=f"objective_select_{active_name}",
+        help="Selected objectives stay visible here. The dashboard updates to show relevant metrics and charts.",
+    )
+    if not chosen:
+        st.info("Select at least one objective to populate the dashboard.")
+        st.stop()
+
+    # Compact filter row. Only dimensions that exist in this dataset are shown.
+    df = raw_df.copy()
+    filter_cols = [c for c in [mapping.get("region"), mapping.get("product"), mapping.get("channel"),
+                               "Source" if "Source" in df.columns and active_name == "All sources (combined)" else None]
+                   if c and c in df.columns and df[c].nunique(dropna=True) <= 80]
+    filter_cols = list(dict.fromkeys(filter_cols))
+    date_series = parse_date(df, mapping.get("date"))
+    fcols = st.columns(1 + len(filter_cols) + (1 if date_series is not None else 0))
+    ci = 0
+    if date_series is not None:
+        dates = date_series.dropna()
+        if not dates.empty:
+            min_d, max_d = dates.min().date(), dates.max().date()
+            selected_range = fcols[ci].date_input("Date range", value=(min_d, max_d), min_value=min_d, max_value=max_d,
+                                                  key=f"date_{active_name}_{min_d}_{max_d}")
+            ci += 1
+            if isinstance(selected_range, tuple) and len(selected_range) == 2:
+                df = df.loc[date_series.dt.date.between(selected_range[0], selected_range[1])]
+    for col in filter_cols:
+        vals = sorted(df[col].dropna().astype(str).unique().tolist())
+        picked = fcols[ci].multiselect(str(col), vals, default=[], placeholder="All", key=f"f_{active_name}_{col}")
+        ci += 1
+        if picked: df = df[df[col].astype(str).isin(picked)]
+
+    date_filtered = parse_date(df, mapping.get("date"))
+    df = df.assign(_date=date_filtered) if date_filtered is not None else df  # typed date column for SQL
+    st.markdown('<div class="section-label">Performance at a glance</div>', unsafe_allow_html=True)
+    sql_log = {}
+    metrics, sql_log["Headline KPIs"] = build_metrics(df, mapping)
+
+    # Latest month vs previous month (historical comparison)
+    mrev, month_sql = monthly_revenue(df, mapping)
+    if month_sql: sql_log["Monthly revenue"] = month_sql
+    if mrev is not None and len(mrev) >= 2 and "Total revenue" in metrics:
+        last, prev = float(mrev.iloc[-1]), float(mrev.iloc[-2])
+        if prev:
+            pct = (last - prev) / prev * 100
+            cls, arrow = ("kpi-up", "▲") if pct >= 0 else ("kpi-down", "▼")
+            metrics["Total revenue"] = (metrics["Total revenue"][0],
+                                        f"<span class='{cls}'>{arrow} {abs(pct):.1f}%</span> {mrev.index[-1]} vs {mrev.index[-2]}")
+
+    objective_metric_order = {
+        "Sales performance": ["Total revenue", "Average order value", "Units sold"],
+        "Profitability": ["Gross profit", "Gross margin"],
+        "Customer analysis": ["Unique customers", "Revenue per customer"],
+        "Marketing performance": ["Marketing spend", "ROAS proxy", "Cost per conversion"],
+        "Campaign funnel": ["Click-through rate", "Click-to-conversion"],
+        "Product / regional analysis": ["Units sold", "Total revenue"],
+    }
+    wanted = []
+    for objective in chosen:
+        for metric in objective_metric_order[objective]:
+            if metric in metrics and metric not in wanted: wanted.append(metric)
+    if not wanted: wanted = list(metrics)[:6]
+    wanted = wanted[:6]
+    if wanted:
+        cards = st.columns(len(wanted))
+        for col, name in zip(cards, wanted):
+            value, note = metrics[name]
+            col.markdown(f'<div class="kpi-card"><div class="kpi-label">{name}</div><div class="kpi-value">{value}</div><div class="kpi-note">{note}</div></div>', unsafe_allow_html=True)
+    else:
+        st.info("The selected objectives do not have enough mapped fields to calculate KPIs.")
+
+    # Charts are selected automatically from the objective + available columns.
+    st.markdown('<div class="section-label" style="margin-top:1rem">Performance analysis</div>', unsafe_allow_html=True)
+    chart_specs = []
+    rev_col, cost_col = mapping.get("revenue"), mapping.get("cost")
+    dim_candidates = []
+    for role in ["product", "region", "channel"]:
+        c = mapping.get(role)
+        if c and c in df.columns and 1 < df[c].nunique(dropna=True) <= 40 and c not in dim_candidates:
+            dim_candidates.append(c)
+    if mrev is not None and "Sales performance" in chosen:
+        trend = pd.DataFrame({"_date": mrev.index.to_timestamp(), "_revenue": mrev.values})
+        fig = px.line(trend, x="_date", y="_revenue", markers=True, title="Revenue trend",
+                      labels={"_date": "Month", "_revenue": "Revenue"})
+        fig.update_traces(line=dict(color="#a64f68", width=2.5), marker=dict(size=5))
+        chart_specs.append(("wide", plot_theme(fig, 260)))
+    if rev_col and rev_col in df.columns and dim_candidates and any(o in chosen for o in ["Sales performance", "Product / regional analysis", "Profitability"]):
+        dcol = dim_candidates[0]
+        tmp, sql_log[f"Revenue by {dcol}"] = breakdown_with_sql(
+            df, q(dcol), {"_metric": f"SUM(TRY_CAST({q(rev_col)} AS DOUBLE))"}, order_by='"_metric" DESC', limit=10)
+        tmp = tmp.rename(columns={"grp": dcol})
+        tmp[dcol] = tmp[dcol].astype(str)
+        fig = px.bar(tmp, x="_metric", y=dcol, orientation="h", title=f"Revenue by {dcol}", text_auto=".2s", labels={"_metric": "Revenue"})
+        fig.update_traces(marker_color="#b8667d", textposition="outside", cliponaxis=False)
+        fig.update_layout(yaxis=dict(categoryorder="total ascending"))
+        chart_specs.append(("half", plot_theme(fig, 260)))
+    if rev_col and cost_col and rev_col in df.columns and cost_col in df.columns and "Profitability" in chosen:
+        tmp = df.assign(Revenue=pd.to_numeric(df[rev_col], errors="coerce").fillna(0), Cost=pd.to_numeric(df[cost_col], errors="coerce").fillna(0))
+        if dim_candidates:
+            tmp = tmp.groupby(dim_candidates[0], as_index=False)[["Revenue", "Cost"]].sum().sort_values("Revenue", ascending=False).head(10)
+            fig = px.bar(tmp, x=dim_candidates[0], y=["Revenue", "Cost"], barmode="group", title="Revenue vs cost",
+                         color_discrete_sequence=["#b8667d", "#d9b2bc"])
+        else:
+            fig = go.Figure(data=[go.Bar(name="Revenue", x=["Total"], y=[tmp.Revenue.sum()], marker_color="#b8667d"),
+                                  go.Bar(name="Cost", x=["Total"], y=[tmp.Cost.sum()], marker_color="#d9b2bc")])
+            fig.update_layout(barmode="group", title="Revenue vs cost")
+        chart_specs.append(("half", plot_theme(fig, 260)))
+    if mapping.get("customer_id") and mapping["customer_id"] in df.columns and "Customer analysis" in chosen:
+        cust = df.groupby(mapping["customer_id"]).size().reset_index(name="Records").sort_values("Records", ascending=False).head(8)
+        cust[mapping["customer_id"]] = cust[mapping["customer_id"]].astype(str)
+        fig = px.bar(cust, x="Records", y=mapping["customer_id"], orientation="h", title="Top customers by records")
+        fig.update_traces(marker_color="#c58a9a")
+        fig.update_layout(yaxis=dict(categoryorder="total ascending", type="category"))
+        chart_specs.append(("half", plot_theme(fig, 250)))
+    if mapping.get("channel") and mapping["channel"] in df.columns and "Marketing performance" in chosen:
+        measure = mapping.get("marketing_spend")
+        if measure and measure in df.columns:
+            tmp = df.assign(_spend=pd.to_numeric(df[measure], errors="coerce")).groupby(mapping["channel"], as_index=False)["_spend"].sum().sort_values("_spend", ascending=False).head(8)
+            fig = px.pie(tmp, names=mapping["channel"], values="_spend", hole=.58, title="Marketing spend by channel")
+            fig.update_traces(marker=dict(colors=["#98445f", "#bd7186", "#d99baa", "#e8c6ce", "#b9a2a9"]))
+            chart_specs.append(("half", plot_theme(fig, 250)))
+    if mapping.get("impressions") and mapping.get("clicks") and "Campaign funnel" in chosen:
+        imp = float(pd.to_numeric(df[mapping["impressions"]], errors="coerce").sum())
+        clk = float(pd.to_numeric(df[mapping["clicks"]], errors="coerce").sum())
+        fig = go.Figure(go.Funnel(y=["Impressions", "Clicks"], x=[imp, clk], textinfo="value+percent initial", marker=dict(color=["#d9a3b0", "#a64f68"])))
+        fig.update_layout(title="Campaign funnel")
+        chart_specs.append(("half", plot_theme(fig, 250)))
+
+    if chart_specs:
+        if chart_specs[0][0] == "wide":
+            st.plotly_chart(chart_specs[0][1], width="stretch", theme=None, config={"displayModeBar": False})
+            rest = chart_specs[1:]
+        else:
+            rest = chart_specs
+        for i in range(0, len(rest), 2):
+            cols = st.columns(2)
+            for j, item in enumerate(rest[i:i + 2]):
+                with cols[j]:
+                    st.plotly_chart(item[1], width="stretch", theme=None, config={"displayModeBar": False})
+    else:
+        st.info("More charts will appear when the selected objectives have suitable date, category or numeric fields.")
+
+    # ----------------------------- AI analysis (Gemini) -----------------------------
+    with st.expander("AI analysis", expanded=False):
+        if not get_secret("GEMINI_API_KEY"):
+            st.write("Add `GEMINI_API_KEY` to the app's secrets to enable AI-written insights. "
+                     "The key stays on the server; viewers never see it.")
+        else:
+            summary = {
+                "dataset": active_name, "rows_analysed": int(len(df)), "objectives": chosen,
+                "kpis": {k: re.sub(r"<[^>]+>", "", f"{v} ({n})") for k, (v, n) in metrics.items()},
+            }
+            if date_filtered is not None and date_filtered.notna().any():
+                summary["date_range"] = f"{date_filtered.min():%Y-%m-%d} to {date_filtered.max():%Y-%m-%d}"
+            if mrev is not None:
+                summary["monthly_revenue_last_12"] = {str(k): round(float(v), 2) for k, v in mrev.tail(12).items()}
+            if rev_col and rev_col in df.columns:
+                for dcol in dim_candidates[:3]:
+                    top = df.assign(_r=pd.to_numeric(df[rev_col], errors="coerce")).groupby(dcol)["_r"].sum().sort_values(ascending=False)
+                    summary[f"revenue_by_{dcol}_top5"] = {str(k): round(float(v), 2) for k, v in top.head(5).items()}
+                    summary[f"revenue_by_{dcol}_bottom3"] = {str(k): round(float(v), 2) for k, v in top.tail(3).items()}
+            st.caption("Only the aggregated figures shown on this page are sent to the model; no row-level records.")
+            if st.button("Generate AI insights", key=f"ai_{active_name}"):
+                with st.spinner("Analysing the latest numbers…"):
+                    try:
+                        st.session_state[f"ai_text_{active_name}"] = gemini_insights(json.dumps(summary, sort_keys=True), GEMINI_MODEL)
+                    except Exception as e:
+                        st.session_state[f"ai_text_{active_name}"] = f"⚠️ AI analysis failed: {e}"
+            if st.session_state.get(f"ai_text_{active_name}"):
+                st.markdown(st.session_state[f"ai_text_{active_name}"])
+
+    # ----------------------------- Data, quality and pipeline status -----------------------------
+    with st.expander("Explore underlying data and data quality"):
+        left, right = st.columns([1.5, 1])
+        with left:
+            st.markdown("**Filtered records**")
+            st.dataframe(df.drop(columns=["_date"], errors="ignore").head(100), width="stretch", height=300, hide_index=True)
+        with right:
+            qdf = df.drop(columns=["_date"], errors="ignore")
+            quality = pd.DataFrame({"Column": qdf.columns.astype(str), "Type": [str(qdf[c].dtype) for c in qdf.columns],
+                                    "Missing": [int(qdf[c].isna().sum()) for c in qdf.columns],
+                                    "Unique": [int(qdf[c].nunique(dropna=True)) for c in qdf.columns]})
+            st.markdown("**Data quality**")
+            st.dataframe(quality, width="stretch", height=300, hide_index=True)
+
+    with st.expander("SQL behind these numbers"):
+        st.caption("Cleaning and KPI calculations run as SQL in an embedded DuckDB engine on every refresh. "
+                   "The live queries for the current view are shown below.")
+        src_names = [n for n in cleaning_sql if n == active_name] or list(cleaning_sql)[:1]
+        for n in src_names:
+            st.markdown(f"**Cleaning: {n}**")
+            st.code(cleaning_sql[n], language="sql")
+        for title, sql in sql_log.items():
+            st.markdown(f"**{title}**")
+            st.code(sql, language="sql")
+
+    with st.expander("Pipeline status"):
+        if pipeline_log:
+            log = pd.DataFrame(pipeline_log)
+            if "numeric_converted" in log:
+                log["numeric_converted"] = log["numeric_converted"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
+            if "empty_columns_dropped" in log:
+                log["empty_columns_dropped"] = log["empty_columns_dropped"].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
+            log = log.rename(columns={"empty_columns_dropped": "Empty columns dropped", "rows_in": "Rows in", "rows_out": "Rows out", "empty_rows_removed": "Empty rows removed",
+                                      "duplicates_removed": "Duplicates removed", "columns": "Columns",
+                                      "numeric_converted": "Text→number columns"})
+            st.dataframe(log, width="stretch", hide_index=True)
+        st.caption("Each source is fetched, validated and cleaned automatically. " +
+                   (f"Connected sources are re-checked every {REFRESH_MINUTES} minutes." if AUTO_REFRESH
+                    else "Connected sources are re-read every time the dashboard is opened, or when Refresh now is pressed."))
+
+    st.caption(f"Showing {len(df):,} of {len(raw_df):,} rows · {len(chosen)} objective(s) selected · Metrics are calculated from the currently filtered dataset.")

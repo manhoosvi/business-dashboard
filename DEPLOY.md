@@ -7,7 +7,9 @@
 
 ## 2. Create the GitHub repo
 1. Go to github.com → **New repository** → name it e.g. `business-dashboard` → Create.
-2. Click **Add file → Upload files** and drag in: `app.py`, `pipeline.py`, `requirements.txt`, `.gitignore`, `DEPLOY.md`.
+2. Click **Add file → Upload files** and drag in: `app.py`, `pipeline.py`, `ai.py`, `requirements.txt`, `DEPLOY.md` and the `.streamlit` folder
+   (it holds `config.toml`, the light theme). If the `.streamlit` folder is hidden on your computer, instead click
+   **Add file → Create new file**, type `.streamlit/config.toml` as the name and paste that file's contents.
 3. Click **Commit changes**. (Do NOT upload secrets or your `.env`.)
 
 ## 3. Deploy on Streamlit Community Cloud
@@ -43,3 +45,13 @@
   - **Stage 3 – breakdown SQL:** grouped queries for monthly trend and revenue by product/region.
 - Open **SQL behind these numbers** at the bottom of the dashboard to see the live queries.
 - Google Sheets stays the source of truth; SQL re-runs on every refresh, so nothing goes stale.
+
+## AI features (need GEMINI_API_KEY)
+- **AI column mapping:** when column names are unusual ("Net Rcpts", "Zone"), Gemini works out which column is
+  revenue, region, etc. AI-matched fields show 🤖 in *Review column mapping*.
+- **Ask your data:** type a question; Gemini writes SQL, the SQL runs on your data (read-only, locked down),
+  and you get the answer, a chart, a table and the SQL used. Broken SQL is fixed automatically once.
+- **AI-suggested analyses:** Gemini proposes the most useful analyses for the dataset, each run as SQL and charted.
+- **AI analysis (Dashboard tab):** a written summary of the KPIs on screen.
+- Privacy: the AI only sees column names, types and up to 3 example values per column (and the KPI totals for
+  the summary), never the full dataset.
