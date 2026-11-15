@@ -47,6 +47,14 @@
 - Google Sheets stays the source of truth; SQL re-runs on every refresh, so nothing goes stale.
 
 ## AI features (need GEMINI_API_KEY)
+- **AI-designed dashboard (default):** on open, Gemini reads the columns, works out what kind of data it is and
+  designs the dashboard: KPIs (including unusual columns like discounts, returns, ratings), charts, filters and
+  which breakdowns to watch. Every query is test-run; broken ones are auto-repaired or dropped. SQL calculates
+  every number. The design is reused until the columns change (no AI cost per visit).
+- **Changes worth a look:** SQL compares the latest month with the previous one (same days if the month is
+  partial) and flags big moves, e.g. "Revenue in Zone = North ▼ 85%".
+- **AI insights:** written automatically once per data change (button when filters are on).
+- If Gemini is down or out of quota, the app falls back to the Standard dashboard automatically.
 - **AI column mapping:** when column names are unusual ("Net Rcpts", "Zone"), Gemini works out which column is
   revenue, region, etc. AI-matched fields show 🤖 in *Review column mapping*.
 - **Ask your data:** type a question; Gemini writes SQL, the SQL runs on your data (read-only, locked down),

@@ -170,3 +170,50 @@ def suggest_analyses(profile: list, key: str, model: str, n: int = 5) -> dict:
         "Use line for trends over time, bar for comparisons between categories, table otherwise."
     )
     return parse_json(generate(prompt, key, model, json_mode=True))
+
+
+# ----------------------------- 5. AI-designed dashboard -----------------------------
+PLAN_SPEC = """Return JSON with exactly these keys:
+{
+ "dataset_type": "short label, e.g. 'E-commerce orders' or 'Ad campaign performance'",
+ "summary": "one sentence on what this data covers",
+ "primary_metric": {"name": "the single most important measure", "expr": "SQL aggregate expression over data, e.g. SUM(TRY_CAST(\\"Sales\\" AS DOUBLE))", "format": "money|number|percent|ratio|days"},
+ "kpis": [{"title": "...", "sql": "SELECT <one aggregate expression> AS value FROM data", "format": "money|number|percent|ratio|days", "note": "very short explanation, e.g. 'Profit / revenue'", "better": "up|down (is a higher value good or bad for the business?)"}],
+ "charts": [{"title": "...", "sql": "...", "chart": "line|bar|pie|table", "why": "one sentence on the business question it answers"}],
+ "filters": ["column names that make good dashboard filters (categorical, under 50 distinct values)"],
+ "breakdowns": ["categorical column names worth monitoring for big changes"]
+}
+Rules:
+- 4 to 6 KPIs and 4 to 6 charts, ordered by importance for decisions.
+- Include columns beyond the obvious ones when they carry business meaning (discounts, returns, ratings, delivery time, status...).
+- KPI queries must return exactly one row with one column named value. Express percentages as 0-100 numbers.
+- If a "_date" column exists, the first chart must be the main metric by month over "_date" (line).
+- Use pie only for share across 2-6 categories. Bar charts: at most 15 categories, sorted descending.
+- Up to 4 filters and up to 3 breakdowns; only use columns that exist."""
+
+
+def plan_dashboard(profile: list, key: str, model: str) -> dict:
+    prompt = (SQL_RULES + "\n\nYou are a senior business analyst designing an automated dashboard for a team, "
+              "for data you have never seen. Decide what the team most needs to see.\n\n"
+              "Columns of data:\n" + json.dumps(profile, indent=1) + "\n\n" + PLAN_SPEC)
+    return parse_json(generate(prompt, key, model, json_mode=True))
+
+
+def repair_queries(profile: list, failures: list, key: str, model: str) -> dict:
+    prompt = (SQL_RULES + "\n\nColumns of data:\n" + json.dumps(profile, indent=1) +
+              "\n\nThese dashboard queries failed. Fix each one so it runs and keeps its purpose "
+              "(KPI queries must still return one row, one column named value).\n" + json.dumps(failures, indent=1) +
+              '\n\nReturn JSON {"fixed": [{"id": "...", "sql": "..."}]}. Omit any you cannot fix.')
+    return parse_json(generate(prompt, key, model, json_mode=True))
+
+
+def write_insights(context: dict, key: str, model: str) -> str:
+    prompt = (
+        "You are the analyst behind an automated team dashboard. Using ONLY the figures in the JSON below "
+        "(all calculated by SQL), write concise markdown with three sections:\n"
+        "**What's happening** (3-5 bullets with numbers), **Watch-outs** (1-3 bullets, use the alerts if any), "
+        "**Recommended actions** (3 specific bullets).\n"
+        "Never invent figures or causes the data cannot show. If the latest period is partial, say so when comparing.\n\n"
+        "```json\n" + json.dumps(context, default=str, indent=1) + "\n```"
+    )
+    return generate(prompt, key, model)

@@ -83,6 +83,22 @@ st.markdown("""
 [data-testid="stHeader"] {background:rgba(247,246,248,.92);}
 [data-testid="stMain"] [data-testid="stMarkdownContainer"] p, [data-testid="stMain"] label p,
 [data-testid="stMain"] [data-testid="stWidgetLabel"] p {color:#202124;}
+/* readable in any browser theme */
+[data-testid="stMain"] h1, [data-testid="stMain"] h2, [data-testid="stMain"] h3, [data-testid="stMain"] h4,
+[data-testid="stMain"] h1 *, [data-testid="stMain"] h2 *, [data-testid="stMain"] h3 * {color:#202124 !important;}
+[data-testid="stMain"] [data-testid="stAlert"] > div {background:#fff7e6 !important; border:1px solid #f3dcb0 !important;}
+[data-testid="stMain"] [data-testid="stAlert"] p, [data-testid="stMain"] [data-testid="stAlert"] * {color:#3d2f12 !important;}
+[data-testid="stMain"] [data-testid="stAlertContentInfo"], [data-testid="stMain"] [data-testid="stAlertContentInfo"] * {color:#1d3557 !important;}
+[data-testid="stMain"] [data-testid="stCaptionContainer"] p {color:#626873 !important;}
+[data-testid="stMain"] [data-testid="stTab"] p {color:#202124 !important;}
+[data-testid="stMain"] [data-testid="stExpander"] summary p {color:#202124 !important;}
+[data-testid="stHeader"] * {color:#555b65;}
+.ai-banner {background:#fff;border:1px solid #ead6dd;border-left:4px solid #a64f68;border-radius:10px;padding:10px 14px;font-size:.86rem;color:#202124;margin:.2rem 0 .9rem;}
+.alert-chip {display:inline-block;font-size:.78rem;padding:5px 11px;border-radius:999px;margin:0 6px 6px 0;border:1px solid;}
+.alert-chip.up {background:#eaf6ef;color:#1e6b3f;border-color:#c5e6d2;} .alert-chip.down {background:#fdecea;color:#9a2a20;border-color:#f5c9c4;}
+.src-err {font-size:.72rem;color:#f2b8a0 !important;margin:-.05rem 0 .4rem 1.35rem;line-height:1.3;}
+.err-table {width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:10px;font-size:.85rem;}
+.err-table td, .err-table th {padding:8px 12px;border-bottom:1px solid #eee;color:#202124;text-align:left;}
 .block-container {padding-top:3.6rem; padding-bottom:1.1rem; max-width:1600px;}
 [data-testid="stSidebar"] {background:#25232b; border-right:1px solid #393640;}
 [data-testid="stSidebar"] * {color:#f5f3f5 !important;}
@@ -291,12 +307,32 @@ def build_metrics(df, m):
     return out, sql
 
 
+DATE_DAYFIRST_DEFAULT = str(get_secret("DATE_DAYFIRST", "true")).lower() in ("1", "true", "yes")
+
+
+def detect_dayfirst(values: pd.Series) -> bool:
+    """For dates like 03/04/2026: day-first if any first part > 12, month-first if any second part > 12."""
+    parts = values.dropna().astype(str).str.extract(r"^\s*(\d{1,2})[/.\-](\d{1,2})[/.\-](\d{2,4})")
+    parts = parts.dropna().astype(int)
+    if parts.empty:
+        return False  # ISO style (2026-03-04) or text months: dayfirst not needed
+    if (parts[0] > 12).any():
+        return True
+    if (parts[1] > 12).any():
+        return False
+    return DATE_DAYFIRST_DEFAULT
+
+
 def parse_date(df, col):
     if not col or col not in df.columns: return None
+    series = df[col]
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return series if series.notna().any() else None
+    dayfirst = detect_dayfirst(series)
     try:
-        parsed = pd.to_datetime(df[col], errors="coerce", format="mixed")
+        parsed = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=dayfirst)
     except (TypeError, ValueError):
-        parsed = pd.to_datetime(df[col], errors="coerce")
+        parsed = pd.to_datetime(series, errors="coerce", dayfirst=dayfirst)
     return parsed if parsed.notna().any() else None
 
 
@@ -398,6 +434,20 @@ def result_chart(res: pd.DataFrame, kind: str = "auto", title: str = ""):
     return plot_theme(fig, 300)
 
 
+def friendly_error(e: Exception) -> str:
+    msg = str(e)
+    low = msg.lower()
+    if "no columns to parse" in low or "no data rows" in low or "empty" in low:
+        return "The sheet is empty. Put column names in row 1 and your data below, then press Refresh now."
+    if "web page instead of data" in low or "401" in low or "403" in low:
+        return "Google won't share this sheet. Open it → Share → General access → Anyone with the link → Viewer."
+    if "404" in low:
+        return "Sheet not found. Check the link in Secrets, it may have a typo or the sheet was deleted."
+    if "timed out" in low or "connection" in low:
+        return "Couldn't reach Google just now. Press Refresh now in a minute."
+    return msg[:160]
+
+
 # ----------------------------- Run the ingestion pipeline -----------------------------
 # A new visit (new browser session) gets a new token, so its first load always pulls fresh data.
 # Within that visit, filters/clicks reuse the same data until "Refresh now" is pressed.
@@ -421,7 +471,7 @@ for name, loc in sources.items():
         pipeline_log.append({"Source": label, "Type": "Connected", "Status": "✅ OK", "Last fetched": raw["fetched_at"], **rep})
     except Exception as e:
         signature.append(f"error:{name}")
-        pipeline_log.append({"Source": name, "Type": "Connected", "Status": f"⚠️ {str(e)[:140]}", "Last fetched": "—"})
+        pipeline_log.append({"Source": name, "Type": "Connected", "Status": f"⚠️ {friendly_error(e)}", "Last fetched": "—"})
 st.session_state["data_sig"] = tuple(signature)
 
 
@@ -452,6 +502,8 @@ with st.sidebar:
         for row in pipeline_log:
             icon = "🟢" if row["Status"].startswith("✅") else "🟠"
             st.markdown(f"<div class='src-row'>{icon} {row['Source']}</div>", unsafe_allow_html=True)
+            if not row["Status"].startswith("✅"):
+                st.markdown(f"<div class='src-err'>{row['Status'].lstrip('⚠️ ')}</div>", unsafe_allow_html=True)
         if st.button("↻ Refresh now", width="stretch"):
             st.session_state["visit_token"] = datetime.now().isoformat()
             if AUTO_REFRESH:
@@ -569,8 +621,10 @@ if raw_df is None:
         st.markdown("**One-off uploads**")
         st.write("Upload CSV / Excel files in the sidebar for a quick look. Uploads are only visible in your own session.")
     if any(not r["Status"].startswith("✅") for r in pipeline_log):
-        st.warning("Some connected sources could not be read:")
-        st.dataframe(pd.DataFrame(pipeline_log)[["Source", "Status"]], hide_index=True, width="stretch")
+        st.warning("Some connected sources could not be read. Fix the issue below, then press Refresh now.")
+        rows = "".join(f"<tr><td><b>{r['Source']}</b></td><td>{r['Status']}</td></tr>"
+                       for r in pipeline_log if not r["Status"].startswith("✅"))
+        st.markdown(f"<table class='err-table'><tr><th>Source</th><th>Problem</th></tr>{rows}</table>", unsafe_allow_html=True)
     st.info("No sample figures are shown. This keeps the dashboard free of misleading demo metrics.")
     st.stop()
 
@@ -586,6 +640,307 @@ if fetched_times:
     pills.append(f"<span class='fresh-pill'>Auto-refresh every {REFRESH_MINUTES} min</span>" if AUTO_REFRESH
                  else "<span class='fresh-pill'>Updates on open</span>")
 st.markdown(f'<div class="dashboard-subtitle">{"".join(pills) or "A live view of the selected dataset."}</div>', unsafe_allow_html=True)
+
+
+# ============================= AI-designed dashboard =============================
+def fmt_value(v, fmt: str) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "—"
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    if fmt == "money": return fmt_money(v)
+    if fmt == "percent": return f"{v:.1f}%"
+    if fmt == "ratio": return f"{v:.2f}x"
+    if fmt == "days": return f"{v:,.1f} days"
+    return f"{v:,.0f}" if abs(v) >= 100 else f"{v:,.2f}"
+
+
+def sql_scalar(data: pd.DataFrame, sql: str):
+    if data is None or data.empty:
+        return None
+    res = ai.run_sql(data, sql, limit=1)
+    if res.empty:
+        return None
+    v = res.iloc[0, 0]
+    return None if pd.isna(v) else v
+
+
+@st.cache_data(ttl=7 * 86400, show_spinner=False)
+def cached_plan(schema_sig: str, _profile_json: str, _df: pd.DataFrame) -> dict:
+    """Gemini designs the dashboard once per data *structure*; every query is test-run and repaired if broken."""
+    prof = json.loads(_profile_json)
+    plan = ai.plan_dashboard(prof, AI_KEY, GEMINI_MODEL)
+    kpis = [k for k in (plan.get("kpis") or [])[:6] if isinstance(k, dict) and k.get("sql")]
+    charts = [c for c in (plan.get("charts") or [])[:6] if isinstance(c, dict) and c.get("sql")]
+    items = {f"kpi{i}": k for i, k in enumerate(kpis)} | {f"chart{i}": c for i, c in enumerate(charts)}
+    failures = []
+    for id_, item in items.items():
+        try:
+            ai.run_sql(_df, item["sql"], limit=5)
+        except Exception as e:
+            failures.append({"id": id_, "title": item.get("title", ""), "sql": item["sql"], "error": str(e)[:300]})
+    repaired = 0
+    if failures:
+        try:
+            fixes = {f["id"]: f["sql"] for f in ai.repair_queries(prof, failures, AI_KEY, GEMINI_MODEL).get("fixed", [])
+                     if isinstance(f, dict) and f.get("sql")}
+        except Exception:
+            fixes = {}
+        for f in failures:
+            item, new = items[f["id"]], fixes.get(f["id"])
+            try:
+                if not new:
+                    raise ValueError("not fixed")
+                ai.run_sql(_df, new, limit=5)
+                item["sql"], item["repaired"] = new, True
+                repaired += 1
+            except Exception:
+                item["drop"] = True
+    plan["kpis"] = [k for k in kpis if not k.get("drop")]
+    plan["charts"] = [c for c in charts if not c.get("drop")]
+    pm = plan.get("primary_metric") or {}
+    try:
+        ai.run_sql(_df, f"SELECT {pm['expr']} AS value FROM data", limit=1)
+    except Exception:
+        plan["primary_metric"] = None
+    cols = set(map(str, _df.columns))
+    ok_col = lambda c: c in cols and c != "_date" and 1 < _df[c].nunique(dropna=True) <= 50
+    plan["filters"] = [c for c in (plan.get("filters") or []) if isinstance(c, str) and ok_col(c)][:4]
+    plan["breakdowns"] = [c for c in (plan.get("breakdowns") or []) if isinstance(c, str) and ok_col(c)][:3]
+    plan["_stats"] = {"queries": len(items), "repaired": repaired, "dropped": len(failures) - repaired}
+    return plan
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def cached_insights(data_key: str, context_json: str) -> str:
+    return ai.write_insights(json.loads(context_json), AI_KEY, GEMINI_MODEL)
+
+
+def compare_periods(data: pd.DataFrame):
+    """Latest month vs previous month. If the latest month is partial, compare the same number of days."""
+    if "_date" not in data.columns or data["_date"].isna().all():
+        return None
+    d = data["_date"]
+    last = d.max().normalize()
+    cs = last.replace(day=1)
+    ps = cs - pd.offsets.MonthBegin(1)
+    partial = last < (cs + pd.offsets.MonthEnd(0)).normalize()
+    pe = min(ps + pd.Timedelta(days=(last - cs).days), cs - pd.Timedelta(days=1)) if partial else cs - pd.Timedelta(days=1)
+    cur = data[(d >= cs) & (d < last + pd.Timedelta(days=1))]
+    prev = data[(d >= ps) & (d < pe + pd.Timedelta(days=1))]
+    if cur.empty or prev.empty:
+        return None
+    label = (f"{cs:%b} 1–{last.day} vs {ps:%b} 1–{pe.day}" if partial else f"{cs:%b %Y} vs {ps:%b %Y}")
+    return cur, prev, label, partial
+
+
+def delta_html(cur, prev, fmt, better="up"):
+    if cur is None or prev is None:
+        return ""
+    cur, prev = float(cur), float(prev)
+    if fmt == "percent":
+        diff = cur - prev
+        good = (diff >= 0) == (better != "down")
+        return f"<span class='{'kpi-up' if good else 'kpi-down'}'>{'▲' if diff >= 0 else '▼'} {abs(diff):.1f} pts</span>"
+    if not prev:
+        return ""
+    pct = (cur - prev) / abs(prev) * 100
+    good = (pct >= 0) == (better != "down")
+    return f"<span class='{'kpi-up' if good else 'kpi-down'}'>{'▲' if pct >= 0 else '▼'} {abs(pct):.1f}%</span>"
+
+
+def find_alerts(plan, periods, threshold=25.0):
+    """SQL-computed: which breakdown groups moved most on the primary metric between the two periods."""
+    pm = plan.get("primary_metric")
+    if not pm or not periods:
+        return []
+    cur, prev, label, _ = periods
+    alerts = []
+    total_cur = sql_scalar(cur, f"SELECT {pm['expr']} AS value FROM data")
+    total_prev = sql_scalar(prev, f"SELECT {pm['expr']} AS value FROM data")
+    if total_cur is not None and total_prev:
+        pct = (float(total_cur) - float(total_prev)) / abs(float(total_prev)) * 100
+        if abs(pct) >= threshold * 0.6:
+            alerts.append({"what": f"Total {pm['name']}", "change_pct": round(pct, 1),
+                           "now": float(total_cur), "before": float(total_prev)})
+    for col in plan.get("breakdowns", []):
+        sql = f"SELECT {q(col)} AS grp, {pm['expr']} AS v FROM data WHERE {q(col)} IS NOT NULL GROUP BY 1"
+        try:
+            a, b = ai.run_sql(cur, sql), ai.run_sql(prev, sql)
+        except Exception:
+            continue
+        m = a.merge(b, on="grp", how="outer", suffixes=("_now", "_before")).fillna(0)
+        scale = max(float(m["v_before"].abs().sum()), 1e-9)
+        for _, r in m.iterrows():
+            if r["v_before"] and abs(r["v_before"]) / scale >= 0.05:
+                pct = (r["v_now"] - r["v_before"]) / abs(r["v_before"]) * 100
+                if abs(pct) >= threshold:
+                    alerts.append({"what": f"{pm['name']} in {col} = {r['grp']}", "change_pct": round(float(pct), 1),
+                                   "now": float(r["v_now"]), "before": float(r["v_before"])})
+    alerts.sort(key=lambda x: abs(x["change_pct"]), reverse=True)
+    return alerts[:5]
+
+
+def render_ai_dashboard(base: pd.DataFrame, data_name: str) -> None:
+    prof_json = json.dumps(ai.schema_profile(base), sort_keys=True)
+    schema_sig = data_name + "|" + "|".join(f"{c}:{base[c].dtype}" for c in base.columns)
+    with st.spinner("🤖 AI is studying the data and designing the dashboard…"):
+        plan = cached_plan(schema_sig, prof_json, base)
+    if not plan.get("kpis") and not plan.get("charts"):
+        raise ValueError("the AI plan had no usable KPIs or charts")
+
+    st.markdown(f"<div class='ai-banner'>🤖 <b>{plan.get('dataset_type', 'Dataset')}</b> · "
+                f"{plan.get('summary', '')}</div>", unsafe_allow_html=True)
+
+    # ---- filters chosen by the AI ----
+    data = base
+    fcols_names = plan.get("filters", [])
+    has_date = "_date" in base.columns and base["_date"].notna().any()
+    widgets = st.columns(max(1, len(fcols_names) + (1 if has_date else 0)))
+    wi, active_filters = 0, {}
+    if has_date:
+        dmin, dmax = base["_date"].min().date(), base["_date"].max().date()
+        rng = widgets[wi].date_input("Date range", value=(dmin, dmax), min_value=dmin, max_value=dmax,
+                                     key=f"ai_date_{data_name}_{dmin}_{dmax}")
+        wi += 1
+        if isinstance(rng, tuple) and len(rng) == 2 and (rng[0], rng[1]) != (dmin, dmax):
+            data = data[data["_date"].dt.date.between(rng[0], rng[1])]
+            active_filters["date"] = f"{rng[0]} to {rng[1]}"
+    for col in fcols_names:
+        vals = sorted(base[col].dropna().astype(str).unique().tolist())
+        picked = widgets[wi].multiselect(col, vals, default=[], placeholder="All", key=f"ai_f_{data_name}_{col}")
+        wi += 1
+        if picked:
+            data = data[data[col].astype(str).isin(picked)]
+            active_filters[col] = picked
+    if data.empty:
+        st.info("No rows match these filters.")
+        return
+    periods = compare_periods(data)
+
+    # ---- KPI cards (SQL), with period comparison ----
+    st.markdown('<div class="section-label">Performance at a glance</div>', unsafe_allow_html=True)
+    kpi_rows = []
+    kpis = plan.get("kpis", [])
+    if kpis:
+        cards = st.columns(len(kpis))
+        for col, k in zip(cards, kpis):
+            fmt = k.get("format", "number")
+            try:
+                v = sql_scalar(data, k["sql"])
+                c_v = sql_scalar(periods[0], k["sql"]) if periods else None
+                p_v = sql_scalar(periods[1], k["sql"]) if periods else None
+            except Exception:
+                v = c_v = p_v = None
+            d_html = delta_html(c_v, p_v, fmt, str(k.get("better", "up")).lower())
+            note = (f"{d_html} {periods[2]}" if d_html else k.get("note", ""))
+            kpi_rows.append({"kpi": k.get("title"), "value": v, "latest_period": c_v, "previous_period": p_v, "format": fmt})
+            col.markdown(f'<div class="kpi-card"><div class="kpi-label">{k.get("title", "")}</div>'
+                         f'<div class="kpi-value">{fmt_value(v, fmt)}</div><div class="kpi-note">{note}</div></div>',
+                         unsafe_allow_html=True)
+
+    # ---- alerts (SQL-computed changes) ----
+    alerts = find_alerts(plan, periods)
+    if alerts:
+        pm_fmt = (plan.get("primary_metric") or {}).get("format", "number")
+        chips = "".join(
+            f"<span class='alert-chip {'up' if a['change_pct'] >= 0 else 'down'}'>"
+            f"{'▲' if a['change_pct'] >= 0 else '▼'} {a['what']}: {abs(a['change_pct']):.0f}% "
+            f"({fmt_value(a['before'], pm_fmt)} → {fmt_value(a['now'], pm_fmt)})</span>" for a in alerts)
+        st.markdown(f"<div class='section-label' style='margin-top:.9rem'>Changes worth a look · {periods[2]}</div>"
+                    f"<div>{chips}</div>", unsafe_allow_html=True)
+
+    # ---- charts (SQL) ----
+    st.markdown('<div class="section-label" style="margin-top:1rem">Performance analysis</div>', unsafe_allow_html=True)
+    chart_results = []
+    figs = []
+    for i, c in enumerate(plan.get("charts", [])):
+        try:
+            res = ai.run_sql(data, c["sql"])
+        except Exception:
+            continue
+        chart_results.append({"chart": c.get("title"), "rows": res.head(12).to_dict("records")})
+        kind = c.get("chart", "auto")
+        if kind == "pie" and res.shape[1] >= 2 and len(res) <= 8:
+            fig = px.pie(res, names=res.columns[0], values=res.columns[1], hole=.55, title=c.get("title", ""))
+            fig.update_traces(marker=dict(colors=["#98445f", "#bd7186", "#d99baa", "#e8c6ce", "#b9a2a9", "#7d3a50"]))
+            fig = plot_theme(fig, 300)
+        else:
+            fig = result_chart(res, kind if kind in ("line", "bar", "table") else "auto", c.get("title", ""))
+        figs.append((c, res, fig))
+    def draw(c, res, fig, key):
+        if fig is not None:
+            st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False}, key=key)
+        else:
+            st.markdown(f"**{c.get('title', '')}**")
+            st.dataframe(res, width="stretch", hide_index=True, height=280)
+        if c.get("why"):
+            st.caption(c["why"])
+
+    if periods and periods[3]:
+        st.caption(f"Note: the latest month is incomplete (data through {data['_date'].max():%d %b}), "
+                   "so monthly totals for it will look lower. KPI changes compare the same days of each month.")
+    rest = figs
+    if figs and figs[0][0].get("chart") == "line" and figs[0][2] is not None:  # main trend full width
+        draw(*figs[0], key="ai_chart_0")
+        rest = figs[1:]
+    for i in range(0, len(rest), 2):
+        cols = st.columns(2)
+        for j, item in enumerate(rest[i:i + 2]):
+            with cols[j]:
+                draw(*item, key=f"ai_chart_{i + j + 1}")
+
+    # ---- automatic AI insights (once per data version; on demand when filtered) ----
+    st.markdown('<div class="section-label" style="margin-top:1rem">AI insights</div>', unsafe_allow_html=True)
+    data_key = hashlib.md5(pd.util.hash_pandas_object(data, index=False).values.tobytes()).hexdigest()
+    context = {"dataset": plan.get("dataset_type"), "rows": int(len(data)), "filters": active_filters,
+               "comparison_period": periods[2] if periods else None,
+               "latest_period_is_partial": bool(periods[3]) if periods else None,
+               "kpis": kpi_rows, "alerts": alerts, "charts": chart_results}
+    if has_date:
+        context["date_range"] = f"{data['_date'].min():%Y-%m-%d} to {data['_date'].max():%Y-%m-%d}"
+    auto = not active_filters
+    if auto or st.button("🤖 Analyse this filtered view", key="ai_filtered_insights"):
+        with st.spinner("Writing insights…"):
+            try:
+                with st.container(border=True):
+                    st.markdown(cached_insights(data_key, json.dumps(context, default=str, sort_keys=True)))
+            except Exception as e:
+                st.warning(f"AI insights unavailable right now: {str(e)[:160]}")
+    else:
+        st.caption("Filters are on. Click the button for insights on this filtered view.")
+
+    # ---- transparency ----
+    with st.expander("How the AI built this dashboard"):
+        stats = plan.get("_stats", {})
+        st.caption(f"Gemini designed this dashboard from the column names and a few example values. "
+                   f"It wrote {stats.get('queries', 0)} SQL queries; {stats.get('repaired', 0)} were auto-repaired and "
+                   f"{stats.get('dropped', 0)} dropped because they didn't run. Every number above comes from SQL. "
+                   f"The design is reused until the columns change; numbers and insights refresh with the data.")
+        for k in plan.get("kpis", []):
+            st.markdown(f"**KPI: {k.get('title')}**" + (" (auto-repaired)" if k.get("repaired") else ""))
+            st.code(k["sql"], language="sql")
+        for c in plan.get("charts", []):
+            st.markdown(f"**Chart: {c.get('title')}**" + (" (auto-repaired)" if c.get("repaired") else ""))
+            st.code(c["sql"], language="sql")
+        if st.button("Redesign dashboard with AI", key="ai_redesign"):
+            cached_plan.clear()
+            st.rerun()
+    with st.expander("Explore underlying data"):
+        st.dataframe(data.drop(columns=["_date"], errors="ignore").head(200), width="stretch", height=300, hide_index=True)
+    with st.expander("Pipeline status"):
+        log = pd.DataFrame(pipeline_log)
+        for c in ("numeric_converted", "empty_columns_dropped"):
+            if c in log:
+                log[c] = log[c].apply(lambda v: ", ".join(v) if isinstance(v, list) else "")
+        st.dataframe(log, width="stretch", hide_index=True)
+        if active_name in cleaning_sql:
+            st.markdown("**Cleaning SQL**")
+            st.code(cleaning_sql[active_name], language="sql")
+    st.caption(f"Showing {len(data):,} of {len(base):,} rows · AI-designed dashboard · numbers calculated with SQL.")
+
 
 tab_dash, tab_ask, tab_suggest = st.tabs(["📊 Dashboard", "💬 Ask your data", "✨ AI-suggested analyses"])
 
@@ -698,6 +1053,17 @@ with tab_suggest:
                      "dataset, each backed by a SQL query that runs on your real data.")
 
 with tab_dash:
+    if AI_ON:
+        mode = st.radio("Dashboard mode", ["🤖 AI-designed", "Standard"], horizontal=True,
+                        label_visibility="collapsed", key="dash_mode")
+        if mode == "🤖 AI-designed":
+            try:
+                render_ai_dashboard(ai_df, active_name)
+                st.stop()
+            except Exception as e:
+                if type(e).__name__ in ("StopException", "RerunException"):
+                    raise
+                st.warning(f"The AI dashboard couldn't be built ({str(e)[:140]}). Showing the standard dashboard instead.")
     available_objectives = []
     for name in OBJECTIVES:
         if name == "Sales performance" and mapping.get("revenue"): available_objectives.append(name)
