@@ -59,6 +59,15 @@ def generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
     client = genai.Client(vertexai=True, api_key=key) if USE_VERTEX else genai.Client(api_key=key)
 
     def call(m):
+        # Ask for quick answers (low "thinking") where the model supports it: much faster responses.
+        fast = dict(cfg or {})
+        fast["thinking_config"] = {"thinking_level": "low"} if not m.startswith("gemini-2") else {"thinking_budget": 0}
+        try:
+            return (client.models.generate_content(model=m, contents=prompt, config=fast).text or "").strip()
+        except Exception as err:
+            low = str(err).lower()
+            if "thinking" not in low and "validation" not in low and "extra" not in low and "unknown" not in low:
+                raise
         return (client.models.generate_content(model=m, contents=prompt, config=cfg).text or "").strip()
 
     first = RESOLVED_MODEL.get(model, model)

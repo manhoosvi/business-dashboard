@@ -23,6 +23,7 @@ import requests
 import streamlit as st
 
 import ai
+from sources_store import SourceStore
 from pipeline import breakdown_with_sql, clean_with_sql, kpis_with_sql, q
 
 try:  # optional, only useful when running locally
@@ -96,6 +97,10 @@ st.markdown("""
 .ai-banner {background:#fff;border:1px solid #ead6dd;border-left:4px solid #a64f68;border-radius:10px;padding:10px 14px;font-size:.86rem;color:#202124;margin:.2rem 0 .9rem;}
 .alert-chip {display:inline-block;font-size:.78rem;padding:5px 11px;border-radius:999px;margin:0 6px 6px 0;border:1px solid;}
 .alert-chip.up {background:#eaf6ef;color:#1e6b3f;border-color:#c5e6d2;} .alert-chip.down {background:#fdecea;color:#9a2a20;border-color:#f5c9c4;}
+[data-testid="stSidebar"] [data-testid="stMultiSelect"] [role="group"] {max-height:none !important;}
+[data-testid="stSidebar"] [data-testid="stMultiSelectTagsContainer"] {overflow:visible !important; max-height:none !important;}
+[data-testid="stSidebar"] [data-testid="stMultiSelectTagsContainer"] > span {max-width:100% !important; height:auto !important;}
+[data-testid="stSidebar"] [data-testid="stMultiSelectTagsContainer"] > span span {white-space:normal !important; overflow:visible !important; text-overflow:clip !important; max-width:none !important;}
 .src-err {font-size:.72rem;color:#f2b8a0 !important;margin:-.05rem 0 .4rem 1.35rem;line-height:1.3;}
 .err-table {width:100%;border-collapse:collapse;background:#fff;border:1px solid #e5e7eb;border-radius:10px;font-size:.85rem;}
 .err-table td, .err-table th {padding:8px 12px;border-bottom:1px solid #eee;color:#202124;text-align:left;}
@@ -128,7 +133,8 @@ h3 {font-size:.94rem !important; color:#202124;}
 [data-testid="stMetric"] {background:#fff;border:1px solid #e5e7eb;border-radius:10px;padding:12px 14px;}
 [data-testid="stMetricLabel"] p {font-size:.75rem;color:#555b65 !important;}
 [data-testid="stMetricValue"] {font-size:1.35rem;color:#202124 !important;}
-[data-testid="stPlotlyChart"] {border:1px solid #e5e7eb;border-radius:10px;padding:4px;background:#fff;}
+[data-testid="stPlotlyChart"] {border:1px solid #e5e7eb;border-radius:10px;padding:4px;background:#fff;overflow:hidden !important;}
+[data-testid="stPlotlyChart"] > div {overflow:hidden !important;}
 .stMultiSelect [data-baseweb="tag"] {background:#a64f68;}
 div[data-testid="stExpander"] {border:1px solid #e5e7eb;border-radius:10px;background:#fff;}
 div[data-testid="stAlert"] p {color:#202124;}
@@ -349,16 +355,26 @@ def monthly_revenue(df, m):
 
 
 def plot_theme(fig, height=260):
+    """One consistent chart style: title on top, legend on its own row under it (side legend for pies)."""
+    is_pie = any(getattr(t, "type", "") == "pie" for t in fig.data)
+    legend_items = sum(1 for t in fig.data if getattr(t, "showlegend", None) is not False and getattr(t, "name", None))
+    has_legend = is_pie or legend_items > 1
     fig.update_layout(
-        height=height, margin=dict(l=12, r=12, t=38, b=12),
-        paper_bgcolor="white", plot_bgcolor="white",
-        template="plotly_white",
+        height=height, margin=dict(l=12, r=12, t=(78 if has_legend and not is_pie else 48), b=12),
+        template="plotly_white", paper_bgcolor="white", plot_bgcolor="white",
         font=dict(family="Arial", size=12, color="#3a3438"),
-        title=dict(font=dict(size=13, color="#3d353b"), x=0.02),
-        legend=dict(orientation="h", y=1.12, x=0, title_text=""),
+        title=dict(font=dict(size=13, color="#3d353b"), x=0.02, xanchor="left", y=0.97, yanchor="top"),
+        showlegend=has_legend,
+        legend=(dict(orientation="v", x=1.0, xanchor="left", y=0.5, yanchor="middle", title_text="", font=dict(size=11))
+                if is_pie else
+                dict(orientation="h", x=0, xanchor="left", y=1.02, yanchor="bottom", title_text="", font=dict(size=11))),
     )
-    fig.update_xaxes(showgrid=False, linecolor="#d9d2d6", tickfont=dict(color="#3a3438"), title_font=dict(color="#3a3438"))
-    fig.update_yaxes(gridcolor="#efe8ec", zeroline=False, tickfont=dict(color="#3a3438"), title_font=dict(color="#3a3438"))
+    if is_pie:
+        fig.update_layout(margin=dict(l=12, r=110, t=48, b=12))
+    fig.update_xaxes(showgrid=False, linecolor="#d9d2d6", tickfont=dict(color="#3a3438"), title_font=dict(color="#3a3438"),
+                     automargin=True)
+    fig.update_yaxes(gridcolor="#efe8ec", zeroline=False, tickfont=dict(color="#3a3438"), title_font=dict(color="#3a3438"),
+                     automargin=True)
     return fig
 
 
@@ -378,6 +394,11 @@ def gemini_insights(summary_json: str, model: str) -> str:
 AI_KEY = str(get_secret("GEMINI_API_KEY", "") or "").strip().strip('"').strip("'")
 ai.USE_VERTEX = str(get_secret("GEMINI_USE_VERTEX", "")).lower() in ("1", "true", "yes")
 AI_ON = bool(AI_KEY)
+
+
+@st.cache_data(ttl=3600, max_entries=32, show_spinner=False)
+def cached_profile(df: pd.DataFrame) -> str:
+    return json.dumps(ai.schema_profile(df), sort_keys=True)
 
 
 @st.cache_data(ttl=7 * 86400, show_spinner=False)
@@ -455,7 +476,25 @@ def friendly_error(e: Exception) -> str:
 if "visit_token" not in st.session_state:
     st.session_state["visit_token"] = datetime.now().isoformat()
 VISIT = "" if AUTO_REFRESH else st.session_state["visit_token"]
-sources = configured_sources()
+STORE = SourceStore(str(get_secret("GITHUB_TOKEN", "") or ""), str(get_secret("GITHUB_REPO", "") or ""),
+                    str(get_secret("GITHUB_BRANCH", "main") or "main"))
+ADMIN_PASSWORD = str(get_secret("ADMIN_PASSWORD", "") or "")
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_saved_sources() -> tuple:
+    try:
+        return STORE.load()[0], ""
+    except Exception as e:
+        return {}, str(e)[:160]
+
+
+secret_sources = configured_sources()
+saved_sources, saved_error = load_saved_sources()
+session_sources = st.session_state.setdefault("session_sources", {})
+sources = {**saved_sources, **session_sources, **secret_sources}
+source_kind = {**{n: "saved" for n in saved_sources}, **{n: "session" for n in session_sources},
+               **{n: "secrets" for n in secret_sources}}
 datasets, pipeline_log, signature, cleaning_sql = {}, [], [], {}
 for name, loc in sources.items():
     try:
@@ -499,11 +538,118 @@ with st.sidebar:
     st.caption("Business performance analytics")
 
     st.markdown("<div style='font-size:.68rem;font-weight:800;letter-spacing:.1em;color:#c9c5cc;margin:1rem 0 .45rem'>CONNECTED DATA</div>", unsafe_allow_html=True)
+    with st.expander("➕ Add or manage sources", expanded=not sources):
+        new_name = st.text_input("Name", placeholder="e.g. Sales 2026", key="new_src_name")
+        new_link = st.text_input("Google Sheet / Drive / CSV link", placeholder="https://docs.google.com/spreadsheets/d/…",
+                                 key="new_src_link")
+        pw = st.text_input("Admin password", type="password", key="admin_pw") if (ADMIN_PASSWORD and STORE.can_save) else ""
+        if st.button("Test & add", width="stretch", key="add_src"):
+            name, link = new_name.strip(), new_link.strip()
+            if not name or not link:
+                st.error("Enter a name and a link.")
+            elif name in sources:
+                st.error(f"'{name}' already exists. Pick another name.")
+            else:
+                try:
+                    raw = fetch_source(link, datetime.now().isoformat())
+                    test_df, _, _ = process_bytes(raw["hash"], raw["bytes"], link)
+                    if test_df.empty:
+                        raise ValueError("no data rows")
+                except Exception as e:
+                    st.error(f"Couldn't read that link: {friendly_error(e)}")
+                else:
+                    if STORE.can_save:
+                        if ADMIN_PASSWORD and pw != ADMIN_PASSWORD:
+                            st.error("Wrong admin password.")
+                        else:
+                            try:
+                                STORE.save({**saved_sources, name: link}, f"Add data source: {name}")
+                                load_saved_sources.clear()
+                                st.success(f"Saved '{name}' for everyone ({len(test_df):,} rows).")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(str(e))
+                    else:
+                        session_sources[name] = link
+                        st.success(f"Added '{name}' for this session ({len(test_df):,} rows). "
+                                   "To save sources for everyone, add GITHUB_TOKEN and GITHUB_REPO to Secrets.")
+                        st.rerun()
+        if sources:
+            st.markdown("<div style='font-size:.72rem;margin-top:.6rem;color:#c9c5cc'>Current sources</div>", unsafe_allow_html=True)
+        for n in list(sources):
+            kind = source_kind.get(n)
+            c1, c2 = st.columns([4, 1])
+            c1.markdown(f"<div class='src-row'>{n}<br><span style='font-size:.66rem;color:#a9a3ad'>"
+                        f"{ {'secrets': '🔒 set in Secrets', 'saved': 'saved for everyone', 'session': 'this session only'}[kind] }"
+                        f"</span></div>", unsafe_allow_html=True)
+            if kind in ("saved", "session") and c2.button("✕", key=f"rm_{n}", help=f"Remove {n}"):
+                if kind == "session":
+                    session_sources.pop(n, None)
+                    st.rerun()
+                elif ADMIN_PASSWORD and pw != ADMIN_PASSWORD:
+                    st.error("Enter the admin password above to remove saved sources.")
+                else:
+                    try:
+                        STORE.save({k: v for k, v in saved_sources.items() if k != n}, f"Remove data source: {n}")
+                        load_saved_sources.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(str(e))
+        if saved_error:
+            st.caption(f"Couldn't load saved sources: {saved_error}")
+        if not STORE.can_save:
+            st.caption("Sources added here last for this session. Add GITHUB_TOKEN + GITHUB_REPO in Secrets to save them for everyone.")
+    # ---- pick the active dataset with radio circles: connected sources here, uploads below ----
+    def pick_from(src_key: str, other_key: str):
+        st.session_state["active_ds"] = st.session_state.get(src_key)
+        st.session_state[other_key] = None
+
+    connected_ok = list(datasets.keys())
+    if len(connected_ok) >= 2:  # combined view when connected sources share the same columns (e.g. monthly sheets)
+        if len({frozenset(map(norm, datasets[n].columns)) for n in connected_ok}) == 1:
+            datasets["All sources (combined)"] = pd.concat([datasets[n].assign(Source=n) for n in connected_ok],
+                                                            ignore_index=True)
+            connected_ok = connected_ok + ["All sources (combined)"]
+
+    # uploads are read first (shown further down) so a sensible default can be chosen
+    upload_files = st.session_state.get("uploads") or []
+    upload_names = []
+    for f in upload_files:
+        try:
+            data = f.getvalue()
+            clean, rep, clean_sql = process_bytes(hashlib.md5(data).hexdigest(), data, f.name)
+            label, n_dup = f"{f.name} (upload)", 2
+            while label in datasets or label in upload_names:   # same file name uploaded twice -> keep both, distinct
+                label = f"{f.name} #{n_dup} (upload)"
+                n_dup += 1
+            cleaning_sql[label] = clean_sql
+            if not clean.empty:
+                datasets[label] = clean
+                upload_names.append(label)
+            pipeline_log.append({"Source": f.name, "Type": "Upload", "Status": "✅ OK" if not clean.empty else "⚠️ The file has no data rows.",
+                                 "Last fetched": datetime.now(TZ).strftime("%d %b %Y, %H:%M"), **rep})
+        except Exception as e:
+            pipeline_log.append({"Source": f.name, "Type": "Upload", "Status": f"⚠️ {friendly_error(e)}", "Last fetched": "—"})
+
+    seen = st.session_state.setdefault("seen_uploads", set())
+    new_uploads = [u for u in upload_names if u not in seen]
+    seen.update(upload_names)
+    active = st.session_state.get("active_ds")
+    if new_uploads:                       # a freshly uploaded file becomes the active dataset
+        active = new_uploads[-1]
+    elif active not in datasets:
+        active = (connected_ok or upload_names or [None])[0]
+    st.session_state["active_ds"] = active
+    st.session_state["pick_conn"] = active if active in connected_ok else None
+    st.session_state["pick_up"] = active if active in upload_names else None
+
     if sources:
+        if connected_ok:
+            st.radio("Connected data", connected_ok, key="pick_conn", label_visibility="collapsed",
+                     format_func=lambda n: f"🟢 {n}", on_change=pick_from, args=("pick_conn", "pick_up"))
         for row in pipeline_log:
-            icon = "🟢" if row["Status"].startswith("✅") else "🟠"
-            st.markdown(f"<div class='src-row'>{icon} {row['Source']}</div>", unsafe_allow_html=True)
-            if not row["Status"].startswith("✅"):
+            if row["Type"] == "Connected" and not row["Status"].startswith("✅"):
+                st.markdown(f"<div class='src-row'>🟠 {row['Source']}</div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='src-err'>{row['Status'].lstrip('⚠️ ')}</div>", unsafe_allow_html=True)
         if st.button("↻ Refresh now", width="stretch"):
             st.session_state["visit_token"] = datetime.now().isoformat()
@@ -515,20 +661,16 @@ with st.sidebar:
         else:
             st.caption("Data refreshes each time the dashboard is opened.")
     else:
-        st.caption("No connected sources yet. Add Google Sheet / Drive links under [data_sources] in the app's secrets.")
+        st.caption("No connected sources yet. Use ➕ Add or manage sources above to connect a Google Sheet.")
 
-    uploads = st.file_uploader("Add CSV / Excel (this session only)", type=["csv", "xlsx", "xls"], accept_multiple_files=True)
-    for f in uploads or []:
-        try:
-            data = f.getvalue()
-            clean, rep, clean_sql = process_bytes(hashlib.md5(data).hexdigest(), data, f.name)
-            cleaning_sql[f"{f.name} (upload)"] = clean_sql
-            if not clean.empty:
-                datasets[f"{f.name} (upload)"] = clean
-            pipeline_log.append({"Source": f.name, "Type": "Upload", "Status": "✅ OK",
-                                 "Last fetched": datetime.now(TZ).strftime("%d %b %Y, %H:%M"), **rep})
-        except Exception as e:
-            st.error(f"{f.name}: {e}")
+    st.file_uploader("Add CSV / Excel (this session only)", type=["csv", "xlsx", "xls"],
+                     accept_multiple_files=True, key="uploads")
+    if upload_names:
+        st.radio("Uploaded files", upload_names, key="pick_up", label_visibility="collapsed",
+                 format_func=lambda n: f"📄 {n.replace(' (upload)', '')}", on_change=pick_from, args=("pick_up", "pick_conn"))
+    for row in pipeline_log:
+        if row["Type"] == "Upload" and not row["Status"].startswith("✅"):
+            st.markdown(f"<div class='src-err'>{row['Source']}: {row['Status'].lstrip('⚠️ ')}</div>", unsafe_allow_html=True)
     st.divider()
 
     st.markdown("<div style='font-size:.68rem;font-weight:800;letter-spacing:.1em;color:#c9c5cc;margin:.35rem 0 .45rem'>DATA SOURCES</div>", unsafe_allow_html=True)
@@ -540,25 +682,19 @@ with st.sidebar:
     st.divider()
 
     st.markdown("<div style='font-size:.68rem;font-weight:800;letter-spacing:.1em;color:#c9c5cc;margin:.35rem 0 .45rem'>ANALYSIS</div>", unsafe_allow_html=True)
-    # Offer a combined view when several sources share the same columns (e.g. monthly files)
-    if len(datasets) >= 2:
-        col_sets = {frozenset(map(norm, d.columns)) for d in datasets.values()}
-        if len(col_sets) == 1:
-            combined = pd.concat([d.assign(Source=n) for n, d in datasets.items()], ignore_index=True)
-            datasets = {"All sources (combined)": combined, **datasets}
-
     active_name, raw_df, mapping = None, None, {}
-    if datasets:
-        active_name = st.selectbox("Dataset", list(datasets.keys()))
+    if datasets and active:
+        active_name = active
         raw_df = datasets[active_name]
         auto = suggest_mapping(raw_df)
         ai_roles = set()
         # AI fallback: if name rules left roles empty and there are unclaimed columns, ask Gemini once
         missing = [r for r in ROLE_ALIASES if r not in auto]
         unclaimed = [c for c in map(str, raw_df.columns) if c not in auto.values()]
-        if AI_ON and missing and unclaimed:
+        ai_view = st.session_state.get("dash_mode", "🤖 AI-designed") == "🤖 AI-designed"
+        if AI_ON and missing and unclaimed and (not ai_view or "date" not in auto):
             try:
-                prof = json.dumps(ai.schema_profile(raw_df), sort_keys=True)
+                prof = cached_profile(raw_df)
                 with st.spinner("AI is reading your columns…"):
                     extra = cached_ai_mapping(prof, tuple(missing), tuple(sorted(auto.values())))
                 auto.update(extra)
@@ -567,16 +703,53 @@ with st.sidebar:
                 st.caption(f"AI column mapping unavailable: {str(e)[:80]}")
         if ai_roles:
             st.caption(f"🤖 AI matched {len(ai_roles)} column(s) the name rules missed. Check them below.")
-        with st.expander("Review column mapping", expanded=False):
-            for role in ROLE_ALIASES:
-                opts = ["Not mapped"] + list(map(str, raw_df.columns))
-                default = auto.get(role, "Not mapped")
-                idx = opts.index(default) if default in opts else 0
-                label = role.replace("_", " ").title() + (" 🤖" if role in ai_roles else "")
-                val = st.selectbox(label, opts, index=idx, key=f"map_{active_name}_{role}_{default}")
-                if val != "Not mapped":
-                    mapping[role] = val
-        st.caption(f"{len(raw_df):,} rows · {len(raw_df.columns)} columns")
+        # Column roles as removable chips ("Revenue → Sales"); one column per role.
+        role_label = lambda r: r.replace("_", " ").title()
+        pair = lambda r, c: f"{role_label(r)} → {c}"
+        all_pairs = [pair(r, c) for r in ROLE_ALIASES for c in map(str, raw_df.columns)]
+        lookup = {pair(r, c): (r, c) for r in ROLE_ALIASES for c in map(str, raw_df.columns)}
+        default_pairs = [pair(r, auto[r]) for r in ROLE_ALIASES if r in auto and auto[r] in raw_df.columns]
+        chip_key = f"roles_{active_name}_{hashlib.md5(json.dumps(auto, sort_keys=True).encode()).hexdigest()[:8]}"
+
+        def one_column_per_role(key=chip_key):
+            kept = {}
+            for p in st.session_state.get(key, []):   # newest choice for a role wins
+                kept[lookup[p][0]] = p
+            st.session_state[key] = list(kept.values())
+
+        with st.expander("Column roles", expanded=False):
+            st.caption("How columns are used by the Standard view. ✕ removes a role. To add or change one, pick a "
+                       "Role and a Column and press Add. Removed one by mistake? Press Reset."
+                       + (f" 🤖 AI matched: {', '.join(role_label(r) for r in sorted(ai_roles))}." if ai_roles else ""))
+            if chip_key not in st.session_state:
+                st.session_state[chip_key] = default_pairs
+
+            def add_role(key=chip_key):
+                r, c = st.session_state.get(f"{key}_role"), st.session_state.get(f"{key}_col")
+                if r and c:
+                    st.session_state[key] = [p for p in st.session_state.get(key, []) if lookup[p][0] != r] + [pair(r, c)]
+
+            def reset_roles(key=chip_key):
+                st.session_state[key] = list(default_pairs)
+
+            # 1) pick a role + column and add it ...
+            mapped_roles = {lookup[p][0] for p in st.session_state.get(chip_key, []) if p in lookup}
+            role_opts = sorted(ROLE_ALIASES, key=lambda r: (r in mapped_roles, list(ROLE_ALIASES).index(r)))
+            st.selectbox("Role", role_opts, key=f"{chip_key}_role",
+                         format_func=lambda r: role_label(r) + ("  (set)" if r in mapped_roles else ""))
+            st.selectbox("Column", list(map(str, raw_df.columns)), key=f"{chip_key}_col")
+            b1, b2 = st.columns(2)
+            b1.button("➕ Add", key=f"{chip_key}_add", on_click=add_role, width="stretch")
+            b2.button("↺ Reset", key=f"{chip_key}_reset", on_click=reset_roles, width="stretch",
+                      help="Restore the automatically detected roles")
+            # 2) ... and it lands in the box below, where ✕ removes it
+            chosen_pairs = st.multiselect("Selected roles", all_pairs, key=chip_key,
+                                          on_change=one_column_per_role,
+                                          placeholder="No roles yet. Add one above.")
+        for p in chosen_pairs:
+            r, c = lookup[p]
+            mapping[r] = c
+        st.caption(f"Using **{active_name.replace(' (upload)', '')}** · {len(raw_df):,} rows · {len(raw_df.columns)} columns")
     else:
         st.caption("Connect a source or upload a file to activate business KPIs and charts.")
 
@@ -616,8 +789,8 @@ if raw_df is None:
     left, right = st.columns(2)
     with left:
         st.markdown("**Connected sources (recommended)**")
-        st.write("Add Google Sheet or Drive links to the app's secrets under `[data_sources]`. "
-                 "The dashboard re-reads them automatically, so when someone updates the sheet, everyone sees the new numbers.")
+        st.write("Paste a Google Sheet link into **➕ Add or manage sources** in the sidebar. "
+                 "The dashboard re-reads it automatically, so when someone updates the sheet, everyone sees the new numbers.")
     with right:
         st.markdown("**One-off uploads**")
         st.write("Upload CSV / Excel files in the sidebar for a quick look. Uploads are only visible in your own session.")
@@ -797,8 +970,54 @@ def find_alerts(plan, periods, threshold=25.0):
     return alerts[:5]
 
 
+@st.cache_data(ttl=3600, max_entries=64, show_spinner=False)
+def compute_ai_view(plan_key: str, data_key: str, _plan: dict, _data: pd.DataFrame) -> dict:
+    """All SQL + chart building for the AI dashboard, cached per (plan, data/filter state)."""
+    plan, data = _plan, _data
+    periods = compare_periods(data)
+    cards, kpi_rows = [], []
+    for k in plan.get("kpis", []):
+        fmt = k.get("format", "number")
+        try:
+            v = sql_scalar(data, k["sql"])
+            c_v = sql_scalar(periods[0], k["sql"]) if periods else None
+            p_v = sql_scalar(periods[1], k["sql"]) if periods else None
+        except Exception:
+            v = c_v = p_v = None
+        d_html = delta_html(c_v, p_v, fmt, str(k.get("better", "up")).lower())
+        note = (f"{d_html} {periods[2]}" if d_html else k.get("note", ""))
+        kpi_rows.append({"kpi": k.get("title"), "value": v, "latest_period": c_v, "previous_period": p_v, "format": fmt})
+        cards.append(f'<div class="kpi-card"><div class="kpi-label">{k.get("title", "")}</div>'
+                     f'<div class="kpi-value">{fmt_value(v, fmt)}</div><div class="kpi-note">{note}</div></div>')
+    alerts = find_alerts(plan, periods)
+    pm_fmt = (plan.get("primary_metric") or {}).get("format", "number")
+    chips = "".join(
+        f"<span class='alert-chip {'up' if a['change_pct'] >= 0 else 'down'}'>"
+        f"{'▲' if a['change_pct'] >= 0 else '▼'} {a['what']}: {abs(a['change_pct']):.0f}% "
+        f"({fmt_value(a['before'], pm_fmt)} → {fmt_value(a['now'], pm_fmt)})</span>" for a in alerts)
+    figs, chart_results = [], []
+    for c in plan.get("charts", []):
+        try:
+            res = ai.run_sql(data, c["sql"])
+        except Exception:
+            continue
+        chart_results.append({"chart": c.get("title"), "rows": res.head(12).to_dict("records")})
+        kind = c.get("chart", "auto")
+        if kind == "pie" and res.shape[1] >= 2 and len(res) <= 8:
+            fig = px.pie(res, names=res.columns[0], values=res.columns[1], hole=.55, title=c.get("title", ""))
+            fig.update_traces(marker=dict(colors=["#98445f", "#bd7186", "#d99baa", "#e8c6ce", "#b9a2a9", "#7d3a50"]))
+            fig = plot_theme(fig, 300)
+        else:
+            fig = result_chart(res, kind if kind in ("line", "bar", "table") else "auto", c.get("title", ""))
+        figs.append((c, res, fig))
+    max_date = f"{data['_date'].max():%d %b}" if "_date" in data.columns and data["_date"].notna().any() else ""
+    return {"cards": cards, "kpi_rows": kpi_rows, "alerts": alerts, "chips": chips, "figs": figs,
+            "chart_results": chart_results, "periods_label": periods[2] if periods else None,
+            "partial": bool(periods[3]) if periods else False, "max_date": max_date}
+
+
 def render_ai_dashboard(base: pd.DataFrame, data_name: str) -> None:
-    prof_json = json.dumps(ai.schema_profile(base), sort_keys=True)
+    prof_json = cached_profile(base)
     schema_sig = data_name + "|" + "|".join(f"{c}:{base[c].dtype}" for c in base.columns)
     with st.spinner("🤖 AI is studying the data and designing the dashboard…"):
         plan = cached_plan(schema_sig, prof_json, base)
@@ -832,58 +1051,26 @@ def render_ai_dashboard(base: pd.DataFrame, data_name: str) -> None:
     if data.empty:
         st.info("No rows match these filters.")
         return
-    periods = compare_periods(data)
+    data_key = hashlib.md5(pd.util.hash_pandas_object(data, index=False).values.tobytes()).hexdigest()
+    plan_key = hashlib.md5(json.dumps(plan, sort_keys=True, default=str).encode()).hexdigest()
+    view = compute_ai_view(plan_key, data_key, plan, data)   # cached: clicks don't recompute SQL or charts
+    periods_label, partial = view["periods_label"], view["partial"]
 
-    # ---- KPI cards (SQL), with period comparison ----
+    # ---- KPI cards ----
     st.markdown('<div class="section-label">Performance at a glance</div>', unsafe_allow_html=True)
-    kpi_rows = []
-    kpis = plan.get("kpis", [])
-    if kpis:
-        cards = st.columns(len(kpis))
-        for col, k in zip(cards, kpis):
-            fmt = k.get("format", "number")
-            try:
-                v = sql_scalar(data, k["sql"])
-                c_v = sql_scalar(periods[0], k["sql"]) if periods else None
-                p_v = sql_scalar(periods[1], k["sql"]) if periods else None
-            except Exception:
-                v = c_v = p_v = None
-            d_html = delta_html(c_v, p_v, fmt, str(k.get("better", "up")).lower())
-            note = (f"{d_html} {periods[2]}" if d_html else k.get("note", ""))
-            kpi_rows.append({"kpi": k.get("title"), "value": v, "latest_period": c_v, "previous_period": p_v, "format": fmt})
-            col.markdown(f'<div class="kpi-card"><div class="kpi-label">{k.get("title", "")}</div>'
-                         f'<div class="kpi-value">{fmt_value(v, fmt)}</div><div class="kpi-note">{note}</div></div>',
-                         unsafe_allow_html=True)
+    if view["cards"]:
+        for col, html in zip(st.columns(len(view["cards"])), view["cards"]):
+            col.markdown(html, unsafe_allow_html=True)
 
-    # ---- alerts (SQL-computed changes) ----
-    alerts = find_alerts(plan, periods)
-    if alerts:
-        pm_fmt = (plan.get("primary_metric") or {}).get("format", "number")
-        chips = "".join(
-            f"<span class='alert-chip {'up' if a['change_pct'] >= 0 else 'down'}'>"
-            f"{'▲' if a['change_pct'] >= 0 else '▼'} {a['what']}: {abs(a['change_pct']):.0f}% "
-            f"({fmt_value(a['before'], pm_fmt)} → {fmt_value(a['now'], pm_fmt)})</span>" for a in alerts)
-        st.markdown(f"<div class='section-label' style='margin-top:.9rem'>Changes worth a look · {periods[2]}</div>"
-                    f"<div>{chips}</div>", unsafe_allow_html=True)
+    # ---- alerts ----
+    if view["chips"]:
+        st.markdown(f"<div class='section-label' style='margin-top:.9rem'>Changes worth a look · {periods_label}</div>"
+                    f"<div>{view['chips']}</div>", unsafe_allow_html=True)
 
-    # ---- charts (SQL) ----
+    # ---- charts ----
     st.markdown('<div class="section-label" style="margin-top:1rem">Performance analysis</div>', unsafe_allow_html=True)
-    chart_results = []
-    figs = []
-    for i, c in enumerate(plan.get("charts", [])):
-        try:
-            res = ai.run_sql(data, c["sql"])
-        except Exception:
-            continue
-        chart_results.append({"chart": c.get("title"), "rows": res.head(12).to_dict("records")})
-        kind = c.get("chart", "auto")
-        if kind == "pie" and res.shape[1] >= 2 and len(res) <= 8:
-            fig = px.pie(res, names=res.columns[0], values=res.columns[1], hole=.55, title=c.get("title", ""))
-            fig.update_traces(marker=dict(colors=["#98445f", "#bd7186", "#d99baa", "#e8c6ce", "#b9a2a9", "#7d3a50"]))
-            fig = plot_theme(fig, 300)
-        else:
-            fig = result_chart(res, kind if kind in ("line", "bar", "table") else "auto", c.get("title", ""))
-        figs.append((c, res, fig))
+    figs = view["figs"]
+
     def draw(c, res, fig, key):
         if fig is not None:
             st.plotly_chart(fig, width="stretch", theme=None, config={"displayModeBar": False}, key=key)
@@ -893,8 +1080,8 @@ def render_ai_dashboard(base: pd.DataFrame, data_name: str) -> None:
         if c.get("why"):
             st.caption(c["why"])
 
-    if periods and periods[3]:
-        st.caption(f"Note: the latest month is incomplete (data through {data['_date'].max():%d %b}), "
+    if partial:
+        st.caption(f"Note: the latest month is incomplete (data through {view['max_date']}), "
                    "so monthly totals for it will look lower. KPI changes compare the same days of each month.")
     rest = figs
     if figs and figs[0][0].get("chart") == "line" and figs[0][2] is not None:  # main trend full width
@@ -905,10 +1092,11 @@ def render_ai_dashboard(base: pd.DataFrame, data_name: str) -> None:
         for j, item in enumerate(rest[i:i + 2]):
             with cols[j]:
                 draw(*item, key=f"ai_chart_{i + j + 1}")
+    kpi_rows, alerts, chart_results = view["kpi_rows"], view["alerts"], view["chart_results"]
+    periods = (None, None, periods_label, partial) if periods_label else None
 
     # ---- automatic AI insights (once per data version; on demand when filtered) ----
     st.markdown('<div class="section-label" style="margin-top:1rem">AI insights</div>', unsafe_allow_html=True)
-    data_key = hashlib.md5(pd.util.hash_pandas_object(data, index=False).values.tobytes()).hexdigest()
     context = {"dataset": plan.get("dataset_type"), "rows": int(len(data)), "filters": active_filters,
                "comparison_period": periods[2] if periods else None,
                "latest_period_is_partial": bool(periods[3]) if periods else None,
@@ -984,7 +1172,7 @@ with tab_ask:
             question = st.text_input("Your question", key="ask_q", placeholder="e.g. Which product sold the most units in March?")
             asked = st.form_submit_button("Ask", type="primary")
         if asked and question.strip():
-            prof = json.dumps(ai.schema_profile(ai_df), sort_keys=True)
+            prof = cached_profile(ai_df)
             with st.spinner("Writing and running SQL…"):
                 try:
                     out = ask_with_retry(question.strip(), prof, ai_df)
@@ -1026,7 +1214,7 @@ with tab_suggest:
     if not AI_ON:
         ai_off_message()
     else:
-        prof = json.dumps(ai.schema_profile(ai_df), sort_keys=True)
+        prof = cached_profile(ai_df)
         sugg_key = f"sugg_{hashlib.md5(prof.encode()).hexdigest()}"
         if st.button("Generate suggestions" if sugg_key not in st.session_state else "Regenerate", type="primary"):
             if sugg_key in st.session_state:
