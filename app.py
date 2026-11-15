@@ -56,7 +56,7 @@ REFRESH_MINUTES = max(1, int(get_secret("REFRESH_MINUTES", 5)))
 REFRESH_SECONDS = REFRESH_MINUTES * 60
 # on_open: keep data steady while someone is clicking around (max 1 h); auto: expire just before each check
 FETCH_TTL = max(30, REFRESH_SECONDS - 15) if AUTO_REFRESH else 3600
-GEMINI_MODEL = str(get_secret("GEMINI_MODEL", "gemini-2.5-flash"))
+GEMINI_MODEL = str(get_secret("GEMINI_MODEL", "gemini-flash-latest"))
 
 
 def configured_sources() -> dict:
@@ -652,7 +652,7 @@ def ai_error_message(e: Exception) -> str:
     if "429" in low or "quota" in low or "resource_exhausted" in low:
         return "Gemini's usage limit was reached. It will work again shortly (free limits reset every minute/day)."
     if "not found" in low and "model" in low:
-        return "The Gemini model name isn't available for this key. Set GEMINI_MODEL in Secrets (e.g. gemini-2.5-flash)."
+        return "The Gemini model name isn't available for this key. Set GEMINI_MODEL in Secrets (e.g. gemini-flash-latest)."
     return str(e)[:160]
 
 

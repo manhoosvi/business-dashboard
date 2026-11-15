@@ -22,17 +22,64 @@ FORBIDDEN = re.compile(
 
 # ----------------------------- Gemini call -----------------------------
 USE_VERTEX = False  # set True only for Google Cloud Vertex AI keys (the app reads GEMINI_USE_VERTEX from Secrets)
+RESOLVED_MODEL = {}  # requested model -> model that actually worked for this key (remembered while the app runs)
+
+
+def _flash_candidates(client) -> list:
+    """Ask Google which models this key can use; prefer the newest stable 'gemini-X.Y-flash'."""
+    names = []
+    try:
+        for m in client.models.list():
+            name = (m.name or "").replace("models/", "")
+            actions = getattr(m, "supported_actions", None) or []
+            if actions and "generateContent" not in actions:
+                continue
+            names.append(name)
+    except Exception:
+        pass
+    ver = lambda n: tuple(int(x) for x in re.findall(r"\d+", n.split("-")[1])) if len(n.split("-")) > 1 else (0,)
+    stable_flash = sorted([n for n in names if re.fullmatch(r"gemini-\d+(\.\d+)?-flash", n)], key=ver, reverse=True)
+    lite = sorted([n for n in names if re.fullmatch(r"gemini-\d+(\.\d+)?-flash-lite", n)], key=ver, reverse=True)
+    return ["gemini-flash-latest"] + stable_flash + lite + ["gemini-flash-lite-latest"]
+
+
+def _model_unavailable(err: Exception) -> bool:
+    low = str(err).lower()
+    return ("404" in low or "not_found" in low or "no longer available" in low or "not supported" in low
+            or ("429" in low and "limit: 0" in low))
 
 
 def generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
-    """Call Gemini through the standard Gemini API. Works with both AI Studio key formats:
-    the older 'AIza...' keys and the newer 'AQ.Ab...' auth keys."""
+    """Call Gemini through the standard Gemini API. Works with both AI Studio key formats
+    ('AIza...' and the newer 'AQ.Ab...'). If the chosen model has been retired, it switches to a current one."""
     from google import genai
 
     cfg = {"response_mime_type": "application/json"} if json_mode else None
     key = key.strip().strip('"').strip("'")
     client = genai.Client(vertexai=True, api_key=key) if USE_VERTEX else genai.Client(api_key=key)
-    return (client.models.generate_content(model=model, contents=prompt, config=cfg).text or "").strip()
+
+    def call(m):
+        return (client.models.generate_content(model=m, contents=prompt, config=cfg).text or "").strip()
+
+    first = RESOLVED_MODEL.get(model, model)
+    try:
+        return call(first)
+    except Exception as err:
+        if not _model_unavailable(err):
+            raise
+        last = err
+    for cand in _flash_candidates(client):
+        if cand == first:
+            continue
+        try:
+            out = call(cand)
+            RESOLVED_MODEL[model] = cand
+            return out
+        except Exception as err:
+            last = err
+            if not _model_unavailable(err):
+                raise
+    raise last
 
 
 def parse_json(text: str) -> dict:
