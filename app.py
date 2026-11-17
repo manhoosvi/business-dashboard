@@ -394,7 +394,9 @@ def gemini_insights(summary_json: str, model: str) -> str:
 # ----------------------------- AI helpers (cached so each question / dataset costs one call) -----------------------------
 AI_KEY = str(get_secret("GEMINI_API_KEY", "") or "").strip().strip('"').strip("'")
 ai.USE_VERTEX = str(get_secret("GEMINI_USE_VERTEX", "")).lower() in ("1", "true", "yes")
-AI_ON = bool(AI_KEY)
+ai.GROQ_KEY = str(get_secret("GROQ_API_KEY", "") or "").strip().strip('"').strip("'")
+ai.GROQ_MODEL = str(get_secret("GROQ_MODEL", "llama-3.3-70b-versatile"))
+AI_ON = bool(AI_KEY or ai.GROQ_KEY)
 
 
 @st.cache_data(ttl=3600, max_entries=32, show_spinner=False)
@@ -819,14 +821,24 @@ st.markdown(f'<div class="dashboard-subtitle">{"".join(pills) or "A live view of
 
 def ai_error_message(e: Exception) -> str:
     low = str(e).lower()
-    if "api key not valid" in low or "api_key_invalid" in low or "permission_denied" in low or "unauthenticated" in low:
+    if "groq" in low and "gemini" in low:  # both providers failed: show exactly what each one said
+        return f"Both AI providers failed. {str(e)[:500]}"
+    if "free tier" in low or "billing" in low or "denied access" in low or "not available in your country" in low:
+        return ("Google is not allowing the free tier for this key's project (a region or account restriction, not a bad key). "
+                "In aistudio.google.com open the API key's project and look for a billing / 'free tier unavailable' notice, "
+                "or add a GROQ_API_KEY in Secrets as a free backup. "
+                f"Google's message: {str(e)[:300]}")
+    if "api key not valid" in low or "api_key_invalid" in low or "unauthenticated" in low:
         return ("Gemini rejected the API key. Check GEMINI_API_KEY in the app's Secrets: copy the whole key from "
                 "aistudio.google.com → Get API key (it may start with 'AQ.' or 'AIza'), inside quotes, with no spaces. "
-                f"Google's message: {str(e)[:120]}")
+                f"Google's message: {str(e)[:300]}")
+    if "permission_denied" in low or "403" in low:
+        return f"Google refused the request (permission). Google's message: {str(e)[:300]}"
     if "429" in low or "quota" in low or "resource_exhausted" in low:
         return "Gemini's usage limit was reached. It will work again shortly (free limits reset every minute/day)."
     if any(t in low for t in ("503", "unavailable", "overloaded", "high demand", "timed out", "timeout")):
-        return "Gemini is overloaded or not responding right now (a temporary problem on Google's side, not your key)."
+        return ("Gemini is overloaded or not responding right now (a temporary problem on Google's side, not your key). "
+                f"Details: {str(e)[:300]}")
     if "not found" in low and "model" in low:
         return "The Gemini model name isn't available for this key. Set GEMINI_MODEL in Secrets (e.g. gemini-flash-latest)."
     return str(e)[:160]
@@ -1434,8 +1446,8 @@ with tab_dash:
 
     # ----------------------------- AI analysis (Gemini) -----------------------------
     with st.expander("AI analysis", expanded=False):
-        if not get_secret("GEMINI_API_KEY"):
-            st.write("Add `GEMINI_API_KEY` to the app's secrets to enable AI-written insights. "
+        if not AI_ON:
+            st.write("Add `GEMINI_API_KEY` (or `GROQ_API_KEY`) to the app's secrets to enable AI-written insights. "
                      "The key stays on the server; viewers never see it.")
         else:
             summary = {
