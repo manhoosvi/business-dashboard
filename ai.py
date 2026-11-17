@@ -49,14 +49,35 @@ def _model_unavailable(err: Exception) -> bool:
             or ("429" in low and "limit: 0" in low))
 
 
+def _transient(err: Exception) -> bool:
+    """Google-side hiccups worth retrying / switching model for: 503 overloaded, 5xx, timeouts, dropped connections."""
+    low = (str(err) + " " + type(err).__name__).lower()
+    return bool(re.search(r"\b(500|502|503|504)\b", low)) or any(
+        t in low for t in ("unavailable", "overloaded", "high demand", "deadline", "timeout", "timed out", "connecterror"))
+
+
+TIMEOUT_MS = 30_000     # max wait for ONE request to Gemini (a hung request used to spin forever)
+TOTAL_BUDGET_S = 80     # give up after this long in total so the app can fall back to the Standard dashboard
+MAX_FALLBACK_MODELS = 3
+
+
 def generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
     """Call Gemini through the standard Gemini API. Works with both AI Studio key formats
-    ('AIza...' and the newer 'AQ.Ab...'). If the chosen model has been retired, it switches to a current one."""
+    ('AIza...' and the newer 'AQ.Ab...').
+    - Every request has a timeout, so a stuck Google server can't freeze the app.
+    - A temporary error (503 overloaded, 5xx, timeout) is retried once, then other current Flash models are tried.
+    - A retired model (404) is replaced by a current one for as long as the app runs."""
+    import time
+
     from google import genai
+    from google.genai import types
 
     cfg = {"response_mime_type": "application/json"} if json_mode else None
     key = key.strip().strip('"').strip("'")
-    client = genai.Client(vertexai=True, api_key=key) if USE_VERTEX else genai.Client(api_key=key)
+    http = types.HttpOptions(timeout=TIMEOUT_MS)
+    client = (genai.Client(vertexai=True, api_key=key, http_options=http) if USE_VERTEX
+              else genai.Client(api_key=key, http_options=http))
+    deadline = time.monotonic() + TOTAL_BUDGET_S
 
     def call(m):
         # Ask for quick answers (low "thinking") where the model supports it: much faster responses.
@@ -66,29 +87,45 @@ def generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
             return (client.models.generate_content(model=m, contents=prompt, config=fast).text or "").strip()
         except Exception as err:
             low = str(err).lower()
-            if "thinking" not in low and "validation" not in low and "extra" not in low and "unknown" not in low:
+            if _transient(err) or not any(t in low for t in ("thinking", "validation", "extra", "unknown")):
                 raise
         return (client.models.generate_content(model=m, contents=prompt, config=cfg).text or "").strip()
 
+    def attempt(m):
+        """One model, with a single quick retry on a temporary error."""
+        try:
+            return call(m)
+        except Exception as err:
+            if _transient(err) and time.monotonic() + 2 + TIMEOUT_MS / 1000 < deadline:
+                time.sleep(2)
+                return call(m)
+            raise
+
     first = RESOLVED_MODEL.get(model, model)
     try:
-        return call(first)
+        return attempt(first)
     except Exception as err:
-        if not _model_unavailable(err):
+        if not (_model_unavailable(err) or _transient(err)):
             raise
-        last = err
+        last, retired = err, _model_unavailable(err)
+
+    tried = [first]
     for cand in _flash_candidates(client):
-        if cand == first:
+        if cand in tried:
             continue
+        if len(tried) > MAX_FALLBACK_MODELS or time.monotonic() + TIMEOUT_MS / 1000 > deadline:
+            break
+        tried.append(cand)
         try:
             out = call(cand)
-            RESOLVED_MODEL[model] = cand
+            if retired:  # only remember the switch when the old model is gone, not when it was merely busy
+                RESOLVED_MODEL[model] = cand
             return out
         except Exception as err:
             last = err
-            if not _model_unavailable(err):
+            if not (_model_unavailable(err) or _transient(err)):
                 raise
-    raise last
+    raise RuntimeError(f"Gemini is temporarily unavailable ({str(last)[:140]}). Models tried: {', '.join(tried)}.") from last
 
 
 def parse_json(text: str) -> dict:

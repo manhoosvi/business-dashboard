@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import time
 from datetime import datetime
 from io import BytesIO
 from typing import Any
@@ -824,6 +825,8 @@ def ai_error_message(e: Exception) -> str:
                 f"Google's message: {str(e)[:120]}")
     if "429" in low or "quota" in low or "resource_exhausted" in low:
         return "Gemini's usage limit was reached. It will work again shortly (free limits reset every minute/day)."
+    if any(t in low for t in ("503", "unavailable", "overloaded", "high demand", "timed out", "timeout")):
+        return "Gemini is overloaded or not responding right now (a temporary problem on Google's side, not your key)."
     if "not found" in low and "model" in low:
         return "The Gemini model name isn't available for this key. Set GEMINI_MODEL in Secrets (e.g. gemini-flash-latest)."
     return str(e)[:160]
@@ -1259,13 +1262,18 @@ with tab_dash:
         mode = st.radio("Dashboard mode", ["🤖 AI-designed", "Standard"], horizontal=True,
                         label_visibility="collapsed", key="dash_mode")
         if mode == "🤖 AI-designed":
-            try:
-                render_ai_dashboard(ai_df, active_name)
-                st.stop()
-            except Exception as e:
-                if type(e).__name__ in ("StopException", "RerunException"):
-                    raise
-                st.warning(f"The AI dashboard couldn't be built: {ai_error_message(e)} Showing the standard dashboard instead.")
+            if time.time() - st.session_state.get("ai_fail_at", 0) < 300:
+                st.info("Gemini failed a moment ago, so the standard dashboard is shown. "
+                        "The AI view is retried automatically after a few minutes.")
+            else:
+                try:
+                    render_ai_dashboard(ai_df, active_name)
+                    st.stop()
+                except Exception as e:
+                    if type(e).__name__ in ("StopException", "RerunException"):
+                        raise
+                    st.session_state["ai_fail_at"] = time.time()
+                    st.warning(f"The AI dashboard couldn't be built: {ai_error_message(e)} Showing the standard dashboard instead.")
     available_objectives = []
     for name in OBJECTIVES:
         if name == "Sales performance" and mapping.get("revenue"): available_objectives.append(name)
