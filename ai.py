@@ -50,10 +50,14 @@ def _model_unavailable(err: Exception) -> bool:
 
 
 def _transient(err: Exception) -> bool:
-    """Google-side hiccups worth retrying / switching model for: 503 overloaded, 5xx, timeouts, dropped connections."""
+    """Temporary Google-side problems worth retrying / switching model for: 503 overloaded, 5xx, timeouts.
+    Uses the HTTP status code when the SDK gives one, so a 403/400 (permissions, billing, bad key) is never retried."""
+    code = getattr(err, "code", None)
+    if isinstance(code, int):
+        return code in (500, 502, 503, 504)
     low = (str(err) + " " + type(err).__name__).lower()
     return bool(re.search(r"\b(500|502|503|504)\b", low)) or any(
-        t in low for t in ("unavailable", "overloaded", "high demand", "deadline", "timeout", "timed out", "connecterror"))
+        t in low for t in ("overloaded", "high demand", "deadline", "timeout", "timed out", "connecterror"))
 
 
 TIMEOUT_MS = 30_000     # max wait for ONE request to Gemini (a hung request used to spin forever)
@@ -61,7 +65,7 @@ TOTAL_BUDGET_S = 80     # give up after this long in total so the app can fall b
 MAX_FALLBACK_MODELS = 3
 
 
-def generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
+def _gemini_generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
     """Call Gemini through the standard Gemini API. Works with both AI Studio key formats
     ('AIza...' and the newer 'AQ.Ab...').
     - Every request has a timeout, so a stuck Google server can't freeze the app.
@@ -126,6 +130,65 @@ def generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
             if not (_model_unavailable(err) or _transient(err)):
                 raise
     raise RuntimeError(f"Gemini is temporarily unavailable ({str(last)[:140]}). Models tried: {', '.join(tried)}.") from last
+
+
+# ----------------------------- Backup provider (Groq) + the one entry point -----------------------------
+GROQ_KEY = ""                          # set by the app from Secrets (GROQ_API_KEY); optional
+GROQ_MODEL = "llama-3.3-70b-versatile"  # override with GROQ_MODEL in Secrets; model names change, check console.groq.com
+_GEMINI_BLOCKED_UNTIL = 0.0            # after a permission/billing error, skip Gemini for a while (only if Groq is available)
+
+
+def _permanent(err: Exception) -> bool:
+    low = str(err).lower()
+    return getattr(err, "code", None) in (401, 403) or any(
+        t in low for t in ("free tier", "billing", "denied access", "api key not valid", "api_key_invalid", "unauthenticated"))
+
+
+def _groq_generate(prompt: str, json_mode: bool = False) -> str:
+    import time
+
+    import requests
+
+    body = {"model": GROQ_MODEL, "messages": [{"role": "user", "content": prompt}], "temperature": 0.2}
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    headers = {"Authorization": f"Bearer {GROQ_KEY.strip()}"}
+    for attempt in range(2):
+        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=body, timeout=45)
+        if r.status_code in (429, 503) and attempt == 0:
+            time.sleep(3)
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f"Groq {r.status_code}: {r.text[:200]}")
+        return (r.json()["choices"][0]["message"]["content"] or "").strip()
+    raise RuntimeError("Groq did not respond")
+
+
+def generate(prompt: str, key: str, model: str, json_mode: bool = False) -> str:
+    """Gemini first; if it fails for any reason and a Groq key is configured, Groq answers instead."""
+    global _GEMINI_BLOCKED_UNTIL
+    import time
+
+    problems = []
+    have_gemini = bool((key or "").strip())
+    if have_gemini and (time.time() >= _GEMINI_BLOCKED_UNTIL or not GROQ_KEY.strip()):
+        try:
+            return _gemini_generate(prompt, key, model, json_mode)
+        except Exception as err:
+            if not GROQ_KEY.strip():
+                raise
+            if _permanent(err):
+                _GEMINI_BLOCKED_UNTIL = time.time() + 600
+            problems.append(f"Gemini: {str(err)[:200]}")
+    elif have_gemini:
+        problems.append("Gemini skipped for a few minutes after a permission/billing error")
+    if GROQ_KEY.strip():
+        try:
+            return _groq_generate(prompt, json_mode)
+        except Exception as err:
+            problems.append(f"Groq: {str(err)[:200]}")
+        raise RuntimeError(" | ".join(problems))
+    raise RuntimeError("No AI key is configured (set GEMINI_API_KEY and/or GROQ_API_KEY in Secrets).")
 
 
 def parse_json(text: str) -> dict:
